@@ -245,6 +245,12 @@ static double convert_timevalue_to_scalar(Datum value, Oid typid,
 static Node *strip_all_phvs_deep(PlannerInfo *root, Node *node);
 static bool contain_placeholder_walker(Node *node, void *context);
 static Node *strip_all_phvs_mutator(Node *node, void *context);
+static double scalarineqsel_internal(PlannerInfo *root, Oid operator,
+									 bool isgt, bool iseq,
+									 Oid collation,
+									 VariableStatData *vardata,
+									 Datum constval, Oid consttype,
+									 bool allow_extrapolation);
 static void examine_simple_variable(PlannerInfo *root, Var *var,
 									VariableStatData *vardata);
 static void examine_indexcol_variable(PlannerInfo *root, IndexOptInfo *index,
@@ -272,6 +278,13 @@ static bool get_actual_variable_endpoint(Relation heapRel,
 static RelOptInfo *find_join_input_rel(PlannerInfo *root, Relids relids);
 static double btcost_correlation(IndexOptInfo *index,
 								 VariableStatData *vardata);
+static double ineq_histogram_selectivity_worker(PlannerInfo *root,
+												 VariableStatData *vardata,
+												 Oid opoid, FmgrInfo *opproc,
+												 bool isgt, bool iseq,
+												 Oid collation,
+												 Datum constval, Oid consttype,
+												 bool allow_extrapolation);
 
 /* Define support routines for MCV hash tables */
 #define SH_PREFIX				MCVHashTable
@@ -654,6 +667,27 @@ scalarineqsel(PlannerInfo *root, Oid operator, bool isgt, bool iseq,
 			  Oid collation,
 			  VariableStatData *vardata, Datum constval, Oid consttype)
 {
+	return scalarineqsel_internal(root, operator, isgt, iseq, collation,
+								  vardata, constval, consttype, false);
+}
+
+double
+scalarineqsel_for_range_pair(PlannerInfo *root, Oid operator,
+							   bool isgt, bool iseq,
+							   Oid collation,
+							   VariableStatData *vardata,
+							   Datum constval, Oid consttype)
+{
+	return scalarineqsel_internal(root, operator, isgt, iseq, collation,
+								  vardata, constval, consttype, true);
+}
+
+static double
+scalarineqsel_internal(PlannerInfo *root, Oid operator, bool isgt, bool iseq,
+					   Oid collation,
+					   VariableStatData *vardata, Datum constval, Oid consttype,
+					   bool allow_extrapolation)
+{
 	Form_pg_statistic stats;
 	FmgrInfo	opproc;
 	double		mcv_selec,
@@ -758,10 +792,11 @@ scalarineqsel(PlannerInfo *root, Oid operator, bool isgt, bool iseq,
 	 * If there is a histogram, determine which bin the constant falls in, and
 	 * compute the resulting contribution to selectivity.
 	 */
-	hist_selec = ineq_histogram_selectivity(root, vardata,
-											operator, &opproc, isgt, iseq,
-											collation,
-											constval, consttype);
+	hist_selec = ineq_histogram_selectivity_worker(root, vardata,
+												   operator, &opproc,
+												   isgt, iseq, collation,
+												   constval, consttype,
+												   allow_extrapolation);
 
 	/*
 	 * Now merge the results from the MCV and histogram calculations,
@@ -783,8 +818,16 @@ scalarineqsel(PlannerInfo *root, Oid operator, bool isgt, bool iseq,
 
 	selec += mcv_selec;
 
-	/* result should be in range, but make sure... */
-	CLAMP_PROBABILITY(selec);
+	if (allow_extrapolation)
+	{
+		if (selec < 0.0 || isnan(selec))
+			selec = 0.0;
+	}
+	else
+	{
+		/* result should be in range, but make sure... */
+		CLAMP_PROBABILITY(selec);
+	}
 
 	return selec;
 }
@@ -1117,6 +1160,20 @@ ineq_histogram_selectivity(PlannerInfo *root,
 						   Oid collation,
 						   Datum constval, Oid consttype)
 {
+	return ineq_histogram_selectivity_worker(root, vardata, opoid, opproc,
+											 isgt, iseq, collation,
+											 constval, consttype, false);
+}
+
+static double
+ineq_histogram_selectivity_worker(PlannerInfo *root,
+								  VariableStatData *vardata,
+								  Oid opoid, FmgrInfo *opproc,
+								  bool isgt, bool iseq,
+								  Oid collation,
+								  Datum constval, Oid consttype,
+								  bool allow_extrapolation)
+{
 	double		hist_selec;
 	AttStatsSlot sslot;
 
@@ -1166,6 +1223,7 @@ ineq_histogram_selectivity(PlannerInfo *root,
 			int			lobound = 0;	/* first possible slot to search */
 			int			hibound = sslot.nvalues;	/* last+1 slot to search */
 			bool		have_end = false;
+			bool		extrapolated = false;
 
 			/*
 			 * If there are only two histogram entries, we'll want up-to-date
@@ -1192,19 +1250,19 @@ ineq_histogram_selectivity(PlannerInfo *root,
 				 * current min or max (unless we already did so above).
 				 */
 				if (probe == 0 && sslot.nvalues > 2)
-					have_end = get_actual_variable_range(root,
-														 vardata,
-														 sslot.staop,
-														 collation,
-														 &sslot.values[0],
-														 NULL);
+					have_end |= get_actual_variable_range(root,
+														  vardata,
+														  sslot.staop,
+														  collation,
+														  &sslot.values[0],
+														  NULL);
 				else if (probe == sslot.nvalues - 1 && sslot.nvalues > 2)
-					have_end = get_actual_variable_range(root,
-														 vardata,
-														 sslot.staop,
-														 collation,
-														 NULL,
-														 &sslot.values[probe]);
+					have_end |= get_actual_variable_range(root,
+														  vardata,
+														  sslot.staop,
+														  collation,
+														  NULL,
+														  &sslot.values[probe]);
 
 				ltcmp = DatumGetBool(FunctionCall2Coll(opproc,
 													   collation,
@@ -1220,22 +1278,68 @@ ineq_histogram_selectivity(PlannerInfo *root,
 
 			if (lobound <= 0)
 			{
-				/*
-				 * Constant is below lower histogram boundary.  More
-				 * precisely, we have found that no entry in the histogram
-				 * satisfies the inequality clause (if !isgt) or they all do
-				 * (if isgt).  We estimate that that's true of the entire
-				 * table, so set histfrac to 0.0 (which we'll flip to 1.0
-				 * below, if isgt).
-				 */
-				histfrac = 0.0;
+				if (allow_extrapolation)
+				{
+					/*
+					 * Constant is below the lower histogram boundary.
+					 * Estimate its relative position by extrapolating against
+					 * the overall histogram span, so range-clause pairing can
+					 * preserve how far the query extends beyond the sampled
+					 * minimum.
+					 */
+					double		val,
+								high,
+								low;
+
+					extrapolated = true;
+					if (convert_to_scalar(constval, consttype, collation,
+										  &val,
+										  sslot.values[0],
+										  sslot.values[sslot.nvalues - 1],
+										  vardata->vartype,
+										  &low, &high) &&
+						high > low)
+					{
+						histfrac = (val - low) / (high - low);
+						if (isnan(histfrac) || isinf(histfrac))
+							histfrac = 0.0;
+					}
+					else
+						histfrac = 0.0;
+				}
+				else
+					histfrac = 0.0;
 			}
 			else if (lobound >= sslot.nvalues)
 			{
-				/*
-				 * Inverse case: constant is above upper histogram boundary.
-				 */
-				histfrac = 1.0;
+				if (allow_extrapolation)
+				{
+					/*
+					 * Inverse case: constant is above the upper histogram
+					 * boundary.
+					 */
+					double		val,
+								high,
+								low;
+
+					extrapolated = true;
+					if (convert_to_scalar(constval, consttype, collation,
+										  &val,
+										  sslot.values[0],
+										  sslot.values[sslot.nvalues - 1],
+										  vardata->vartype,
+										  &low, &high) &&
+						high > low)
+					{
+						histfrac = (val - low) / (high - low);
+						if (isnan(histfrac) || isinf(histfrac))
+							histfrac = 1.0;
+					}
+					else
+						histfrac = 1.0;
+				}
+				else
+					histfrac = 1.0;
 			}
 			else
 			{
@@ -1394,25 +1498,27 @@ ineq_histogram_selectivity(PlannerInfo *root,
 			hist_selec = isgt ? (1.0 - histfrac) : histfrac;
 
 			/*
-			 * The histogram boundaries are only approximate to begin with,
-			 * and may well be out of date anyway.  Therefore, don't believe
-			 * extremely small or large selectivity estimates --- unless we
-			 * got actual current endpoint values from the table, in which
-			 * case just do the usual sanity clamp.  Somewhat arbitrarily, we
-			 * set the cutoff for other cases at a hundredth of the histogram
-			 * resolution.
+			 * Only clamp interior estimates.  For bounds beyond the sampled
+			 * endpoints we intentionally preserve how far outside the
+			 * histogram they fall, so range-clause pairing can extrapolate
+			 * row counts from the query span.
 			 */
-			if (have_end)
-				CLAMP_PROBABILITY(hist_selec);
-			else
+			if (!allow_extrapolation || !extrapolated)
 			{
-				double		cutoff = 0.01 / (double) (sslot.nvalues - 1);
+				if (have_end)
+					CLAMP_PROBABILITY(hist_selec);
+				else
+				{
+					double		cutoff = 0.01 / (double) (sslot.nvalues - 1);
 
-				if (hist_selec < cutoff)
-					hist_selec = cutoff;
-				else if (hist_selec > 1.0 - cutoff)
-					hist_selec = 1.0 - cutoff;
+					if (hist_selec < cutoff)
+						hist_selec = cutoff;
+					else if (hist_selec > 1.0 - cutoff)
+						hist_selec = 1.0 - cutoff;
+				}
 			}
+			else if (hist_selec < 0.0 || isnan(hist_selec))
+				hist_selec = 0.0;
 		}
 		else if (sslot.nvalues > 1)
 		{

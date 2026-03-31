@@ -147,4 +147,45 @@ SELECT explain_mask_costs($$
 SELECT * FROM tenk1 WHERE unique1 <> ALL (ARRAY[1, 2, 98, (SELECT 99), NULL]);$$,
 false, true, false, true);
 
+--
+-- Scalar range predicates should extrapolate past histogram endpoints based
+-- on how much of the query interval lies outside the sampled range.
+--
+CREATE TABLE scalar_range_est_test AS
+SELECT g AS x
+FROM generate_series(1, 1000) g;
+ALTER TABLE scalar_range_est_test ALTER COLUMN x SET STATISTICS 1000;
+ANALYZE scalar_range_est_test;
+\a\t
+SELECT * FROM explain_mask_costs($$
+SELECT * FROM scalar_range_est_test WHERE x BETWEEN 501 AND 2000;$$,
+true, true, false, true);
+\a\t
+DROP TABLE scalar_range_est_test;
+
+--
+-- Range and multirange histogram estimates should avoid exact zero when the
+-- finite query bound lies past the histogram maximum.
+--
+CREATE TABLE range_est_test AS
+SELECT numrange(i, i + 1) AS r
+FROM generate_series(1, 20000) g(i);
+ANALYZE range_est_test;
+\a\t
+SELECT * FROM explain_mask_costs($$
+SELECT * FROM range_est_test WHERE r && numrange(40000, 40001);$$,
+true, true, false, true);
+
+CREATE TABLE multirange_est_test AS
+SELECT nummultirange(numrange(i, i + 1)) AS mr
+FROM generate_series(1, 20000) g(i);
+ANALYZE multirange_est_test;
+SELECT * FROM explain_mask_costs($$
+SELECT * FROM multirange_est_test WHERE mr && numrange(40000, 40001);$$,
+true, true, false, true);
+\a\t
+
+DROP TABLE range_est_test;
+DROP TABLE multirange_est_test;
+
 DROP FUNCTION explain_mask_costs(text, bool, bool, bool, bool);

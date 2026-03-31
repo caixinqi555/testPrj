@@ -36,10 +36,17 @@ typedef struct RangeQueryClause
 	bool		have_hibound;	/* found a high-bound clause yet? */
 	Selectivity lobound;		/* Selectivity of a var > something clause */
 	Selectivity hibound;		/* Selectivity of a var < something clause */
+	Node	   *lobound_clause; /* original low-bound clause */
+	Node	   *hibound_clause; /* original high-bound clause */
+	bool		lobound_varonleft;
+	bool		hibound_varonleft;
 } RangeQueryClause;
 
 static void addRangeClause(RangeQueryClause **rqlist, Node *clause,
 						   bool varonleft, bool isLTsel, Selectivity s2);
+static bool get_range_pair_extrapolated_sel(PlannerInfo *root, Node *clause,
+											 int varRelid, bool varonleft,
+											 Selectivity *s2);
 static RelOptInfo *find_single_rel_for_clauses(PlannerInfo *root,
 											   List *clauses);
 static Selectivity clauselist_selectivity_or(PlannerInfo *root,
@@ -274,20 +281,35 @@ clauselist_selectivity_ext(PlannerInfo *root,
 		{
 			/* Successfully matched a pair of range clauses */
 			Selectivity s2;
+			Selectivity lobound = rqlist->lobound;
+			Selectivity hibound = rqlist->hibound;
+
+			if (rqlist->lobound_clause != NULL)
+				(void) get_range_pair_extrapolated_sel(root,
+													   rqlist->lobound_clause,
+													   varRelid,
+													   rqlist->lobound_varonleft,
+													   &lobound);
+			if (rqlist->hibound_clause != NULL)
+				(void) get_range_pair_extrapolated_sel(root,
+													   rqlist->hibound_clause,
+													   varRelid,
+													   rqlist->hibound_varonleft,
+													   &hibound);
 
 			/*
 			 * Exact equality to the default value probably means the
 			 * selectivity function punted.  This is not airtight but should
 			 * be good enough.
 			 */
-			if (rqlist->hibound == DEFAULT_INEQ_SEL ||
-				rqlist->lobound == DEFAULT_INEQ_SEL)
+			if (hibound == DEFAULT_INEQ_SEL ||
+				lobound == DEFAULT_INEQ_SEL)
 			{
 				s2 = DEFAULT_RANGE_INEQ_SEL;
 			}
 			else
 			{
-				s2 = rqlist->hibound + rqlist->lobound - 1.0;
+				s2 = hibound + lobound - 1.0;
 
 				/* Adjust for double-exclusion of NULLs */
 				s2 += nulltestsel(root, IS_NULL, rqlist->var,
@@ -457,6 +479,8 @@ addRangeClause(RangeQueryClause **rqlist, Node *clause,
 			{
 				rqelem->have_lobound = true;
 				rqelem->lobound = s2;
+				rqelem->lobound_clause = clause;
+				rqelem->lobound_varonleft = varonleft;
 			}
 			else
 			{
@@ -468,7 +492,11 @@ addRangeClause(RangeQueryClause **rqlist, Node *clause,
 				 *------
 				 */
 				if (rqelem->lobound > s2)
+				{
 					rqelem->lobound = s2;
+					rqelem->lobound_clause = clause;
+					rqelem->lobound_varonleft = varonleft;
+				}
 			}
 		}
 		else
@@ -477,6 +505,8 @@ addRangeClause(RangeQueryClause **rqlist, Node *clause,
 			{
 				rqelem->have_hibound = true;
 				rqelem->hibound = s2;
+				rqelem->hibound_clause = clause;
+				rqelem->hibound_varonleft = varonleft;
 			}
 			else
 			{
@@ -488,7 +518,11 @@ addRangeClause(RangeQueryClause **rqlist, Node *clause,
 				 *------
 				 */
 				if (rqelem->hibound > s2)
+				{
 					rqelem->hibound = s2;
+					rqelem->hibound_clause = clause;
+					rqelem->hibound_varonleft = varonleft;
+				}
 			}
 		}
 		return;
@@ -502,15 +536,89 @@ addRangeClause(RangeQueryClause **rqlist, Node *clause,
 		rqelem->have_lobound = true;
 		rqelem->have_hibound = false;
 		rqelem->lobound = s2;
+		rqelem->lobound_clause = clause;
+		rqelem->lobound_varonleft = varonleft;
+		rqelem->hibound_clause = NULL;
 	}
 	else
 	{
 		rqelem->have_lobound = false;
 		rqelem->have_hibound = true;
 		rqelem->hibound = s2;
+		rqelem->hibound_clause = clause;
+		rqelem->hibound_varonleft = varonleft;
+		rqelem->lobound_clause = NULL;
 	}
 	rqelem->next = *rqlist;
 	*rqlist = rqelem;
+}
+
+static bool
+get_range_pair_extrapolated_sel(PlannerInfo *root, Node *clause,
+								   int varRelid, bool varonleft,
+								   Selectivity *s2)
+{
+	OpExpr			   *expr = (OpExpr *) clause;
+	Node			   *var;
+	Node			   *other;
+	VariableStatData	vardata;
+	Oid					opno;
+	Oid					oprrest;
+	bool				isgt;
+	bool				iseq;
+
+	var = varonleft ? linitial(expr->args) : lsecond(expr->args);
+	other = varonleft ? lsecond(expr->args) : linitial(expr->args);
+	other = estimate_expression_value(root, other);
+	other = strip_implicit_coercions(other);
+
+	if (!IsA(other, Const) || ((Const *) other)->constisnull)
+		return false;
+
+	opno = expr->opno;
+	if (!varonleft)
+	{
+		opno = get_commutator(opno);
+		if (!OidIsValid(opno))
+			return false;
+	}
+
+	oprrest = get_oprrest(opno);
+	switch (oprrest)
+	{
+		case F_SCALARLTSEL:
+			isgt = false;
+			iseq = false;
+			break;
+		case F_SCALARLESEL:
+			isgt = false;
+			iseq = true;
+			break;
+		case F_SCALARGTSEL:
+			isgt = true;
+			iseq = false;
+			break;
+		case F_SCALARGESEL:
+			isgt = true;
+			iseq = true;
+			break;
+		default:
+			return false;
+	}
+
+	examine_variable(root, var, varRelid, &vardata);
+	if (!HeapTupleIsValid(vardata.statsTuple))
+	{
+		ReleaseVariableStats(vardata);
+		return false;
+	}
+
+	*s2 = scalarineqsel_for_range_pair(root, opno, isgt, iseq,
+									   expr->inputcollid, &vardata,
+									   ((Const *) other)->constvalue,
+									   ((Const *) other)->consttype);
+	ReleaseVariableStats(vardata);
+	return true;
 }
 
 /*

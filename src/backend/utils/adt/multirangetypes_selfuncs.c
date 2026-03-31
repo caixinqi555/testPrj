@@ -42,6 +42,18 @@ static double calc_hist_selectivity_scalar(TypeCacheEntry *typcache,
 										   const RangeBound *constbound,
 										   const RangeBound *hist,
 										   int hist_nvalues, bool equal);
+static double clamp_hist_extreme_selectivity(TypeCacheEntry *typcache,
+											 const RangeBound *constbound,
+											 const RangeBound *hist,
+											 int hist_nvalues,
+											 double selec);
+static double clamp_hist_result(TypeCacheEntry *typcache,
+								const RangeBound *const_lower,
+								const RangeBound *const_upper,
+								const RangeBound *hist_lower,
+								const RangeBound *hist_upper,
+								int hist_nvalues,
+								double selec);
 static int	rbound_bsearch(TypeCacheEntry *typcache, const RangeBound *value,
 						   const RangeBound *hist, int hist_length, bool equal);
 static float8 get_position(TypeCacheEntry *typcache, const RangeBound *value,
@@ -695,7 +707,8 @@ calc_hist_selectivity(TypeCacheEntry *typcache, VariableStatData *vardata,
 	free_attstatsslot(&lslot);
 	free_attstatsslot(&hslot);
 
-	return hist_selec;
+	return clamp_hist_result(rng_typcache, &const_lower, &const_upper,
+							 hist_lower, hist_upper, nhist, hist_selec);
 }
 
 
@@ -721,6 +734,89 @@ calc_hist_selectivity_scalar(TypeCacheEntry *typcache, const RangeBound *constbo
 	if (index >= 0 && index < hist_nvalues - 1)
 		selec += get_position(typcache, constbound, &hist[index],
 							  &hist[index + 1]) / (Selectivity) (hist_nvalues - 1);
+
+	return clamp_hist_extreme_selectivity(typcache, constbound, hist,
+										  hist_nvalues, selec);
+}
+
+/*
+ * Like scalarineqsel(), don't trust exact 0/1 estimates when a finite bound
+ * lies outside the histogram.  The table's real min/max might have moved since
+ * the last ANALYZE, so keep the estimate slightly away from the extremes.
+ */
+static double
+clamp_hist_extreme_selectivity(TypeCacheEntry *typcache,
+								 const RangeBound *constbound,
+								 const RangeBound *hist,
+								 int hist_nvalues,
+								 double selec)
+{
+	double		cutoff;
+
+	if (constbound->infinite || hist_nvalues <= 1)
+		return selec;
+
+	cutoff = 0.01 / (double) (hist_nvalues - 1);
+
+	if (range_cmp_bounds(typcache, constbound, &hist[0]) < 0)
+		return Max(selec, cutoff);
+
+	if (range_cmp_bounds(typcache, constbound, &hist[hist_nvalues - 1]) > 0)
+		return Min(selec, 1.0 - cutoff);
+
+	return selec;
+}
+
+/*
+ * Keep composed multirange estimates away from exact 0/1 when any finite
+ * query bound lies outside the bound histograms.  This catches cases like
+ * "&&", where complementary scalar estimates can still combine to an exact
+ * extreme.
+ */
+static double
+clamp_hist_result(TypeCacheEntry *typcache,
+				   const RangeBound *const_lower,
+				   const RangeBound *const_upper,
+				   const RangeBound *hist_lower,
+				   const RangeBound *hist_upper,
+				   int hist_nvalues,
+				   double selec)
+{
+	double		cutoff;
+	bool		outside = false;
+
+	if (hist_nvalues <= 1)
+		return selec;
+
+	if (!const_lower->infinite)
+	{
+		outside |= (range_cmp_bounds(typcache, const_lower, &hist_lower[0]) < 0);
+		outside |= (range_cmp_bounds(typcache, const_lower,
+									 &hist_lower[hist_nvalues - 1]) > 0);
+		outside |= (range_cmp_bounds(typcache, const_lower, &hist_upper[0]) < 0);
+		outside |= (range_cmp_bounds(typcache, const_lower,
+									 &hist_upper[hist_nvalues - 1]) > 0);
+	}
+
+	if (!const_upper->infinite)
+	{
+		outside |= (range_cmp_bounds(typcache, const_upper, &hist_lower[0]) < 0);
+		outside |= (range_cmp_bounds(typcache, const_upper,
+									 &hist_lower[hist_nvalues - 1]) > 0);
+		outside |= (range_cmp_bounds(typcache, const_upper, &hist_upper[0]) < 0);
+		outside |= (range_cmp_bounds(typcache, const_upper,
+									 &hist_upper[hist_nvalues - 1]) > 0);
+	}
+
+	if (!outside)
+		return selec;
+
+	cutoff = 0.01 / (double) (hist_nvalues - 1);
+
+	if (selec <= 0.0)
+		return cutoff;
+	if (selec >= 1.0)
+		return 1.0 - cutoff;
 
 	return selec;
 }
@@ -1238,6 +1334,16 @@ calc_hist_selectivity_contained(TypeCacheEntry *typcache,
 		bin_width = 1.0;
 		prev_dist = dist;
 	}
+
+	/*
+	 * See rangetypes_selfuncs.c calc_hist_selectivity_contained: when the
+	 * constant lower bound is strictly past the histogram's high end, the
+	 * bin_width logic can collapse to zero even though there may be tuples
+	 * beyond the last histogram sample.
+	 */
+	if (sum_frac <= 0.0 &&
+		range_cmp_bounds(typcache, lower, &hist_lower[hist_nvalues - 1]) > 0)
+		sum_frac = default_multirange_selectivity(OID_MULTIRANGE_MULTIRANGE_CONTAINED_OP);
 
 	return sum_frac;
 }
