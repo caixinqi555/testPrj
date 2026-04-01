@@ -211,21 +211,37 @@ false, true, false, true);
 (4 rows)
 
 --
--- Scalar range predicates should extrapolate past histogram endpoints based
--- on how much of the query interval lies outside the sampled range.
+-- Scalar range predicates should consider rows inserted after the last
+-- ANALYZE under a right-tail growth model, while still capping selectivity
+-- at 1.
 --
 CREATE TABLE scalar_range_est_test AS
-SELECT g AS x
+SELECT g AS x, repeat('x', 200) AS pad
 FROM generate_series(1, 1000) g;
 ALTER TABLE scalar_range_est_test ALTER COLUMN x SET STATISTICS 1000;
 ANALYZE scalar_range_est_test;
+INSERT INTO scalar_range_est_test
+SELECT g, repeat('x', 200)
+FROM generate_series(1001, 2000) g;
 \a\t
+SELECT * FROM explain_mask_costs($$
+SELECT * FROM scalar_range_est_test WHERE x >= 1501;$$,
+true, true, false, true);
+Seq Scan on scalar_range_est_test  (cost=N..N rows=500 width=N) (actual rows=500.00 loops=1)
+  Filter: (x >= 1501)
+  Rows Removed by Filter: 1500
 SELECT * FROM explain_mask_costs($$
 SELECT * FROM scalar_range_est_test WHERE x BETWEEN 501 AND 2000;$$,
 true, true, false, true);
-Seq Scan on scalar_range_est_test  (cost=N..N rows=1502 width=N) (actual rows=500.00 loops=1)
+Seq Scan on scalar_range_est_test  (cost=N..N rows=1500 width=N) (actual rows=1500.00 loops=1)
   Filter: ((x >= 501) AND (x <= 2000))
   Rows Removed by Filter: 500
+SELECT * FROM explain_mask_costs($$
+SELECT * FROM scalar_range_est_test WHERE x BETWEEN 1000 AND 1000;$$,
+true, true, false, true);
+Seq Scan on scalar_range_est_test  (cost=N..N rows=1 width=N) (actual rows=1.00 loops=1)
+  Filter: ((x >= 1000) AND (x <= 1000))
+  Rows Removed by Filter: 1999
 \a\t
 DROP TABLE scalar_range_est_test;
 

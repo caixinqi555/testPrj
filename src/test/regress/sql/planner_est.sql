@@ -148,17 +148,27 @@ SELECT * FROM tenk1 WHERE unique1 <> ALL (ARRAY[1, 2, 98, (SELECT 99), NULL]);$$
 false, true, false, true);
 
 --
--- Scalar range predicates should extrapolate past histogram endpoints based
--- on how much of the query interval lies outside the sampled range.
+-- Scalar range predicates should consider rows inserted after the last
+-- ANALYZE under a right-tail growth model, while still capping selectivity
+-- at 1.
 --
 CREATE TABLE scalar_range_est_test AS
-SELECT g AS x
+SELECT g AS x, repeat('x', 200) AS pad
 FROM generate_series(1, 1000) g;
 ALTER TABLE scalar_range_est_test ALTER COLUMN x SET STATISTICS 1000;
 ANALYZE scalar_range_est_test;
+INSERT INTO scalar_range_est_test
+SELECT g, repeat('x', 200)
+FROM generate_series(1001, 2000) g;
 \a\t
 SELECT * FROM explain_mask_costs($$
+SELECT * FROM scalar_range_est_test WHERE x >= 1501;$$,
+true, true, false, true);
+SELECT * FROM explain_mask_costs($$
 SELECT * FROM scalar_range_est_test WHERE x BETWEEN 501 AND 2000;$$,
+true, true, false, true);
+SELECT * FROM explain_mask_costs($$
+SELECT * FROM scalar_range_est_test WHERE x BETWEEN 1000 AND 1000;$$,
 true, true, false, true);
 \a\t
 DROP TABLE scalar_range_est_test;

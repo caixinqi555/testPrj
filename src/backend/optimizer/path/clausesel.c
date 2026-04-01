@@ -36,6 +36,8 @@ typedef struct RangeQueryClause
 	bool		have_hibound;	/* found a high-bound clause yet? */
 	Selectivity lobound;		/* Selectivity of a var > something clause */
 	Selectivity hibound;		/* Selectivity of a var < something clause */
+	Selectivity pair_lobound;	/* nongrowth selectivity for pair combine */
+	Selectivity pair_hibound;	/* nongrowth selectivity for pair combine */
 	Node	   *lobound_clause; /* original low-bound clause */
 	Node	   *hibound_clause; /* original high-bound clause */
 	bool		lobound_varonleft;
@@ -43,10 +45,19 @@ typedef struct RangeQueryClause
 } RangeQueryClause;
 
 static void addRangeClause(RangeQueryClause **rqlist, Node *clause,
-						   bool varonleft, bool isLTsel, Selectivity s2);
-static bool get_range_pair_extrapolated_sel(PlannerInfo *root, Node *clause,
-											 int varRelid, bool varonleft,
-											 Selectivity *s2);
+						   bool varonleft, bool isLTsel,
+						   Selectivity s2, Selectivity pair_s2);
+static bool get_range_pair_selectivity(PlannerInfo *root, Node *clause,
+									   int varRelid, bool varonleft,
+									   bool use_growth_model,
+									   Selectivity *s2);
+static Selectivity combine_range_pair_selectivity(PlannerInfo *root,
+												  RangeQueryClause *rqlist,
+												  Selectivity lobound,
+												  Selectivity hibound,
+												  int varRelid,
+												  JoinType jointype,
+												  SpecialJoinInfo *sjinfo);
 static RelOptInfo *find_single_rel_for_clauses(PlannerInfo *root,
 											   List *clauses);
 static Selectivity clauselist_selectivity_or(PlannerInfo *root,
@@ -249,14 +260,24 @@ clauselist_selectivity_ext(PlannerInfo *root,
 				{
 					case F_SCALARLTSEL:
 					case F_SCALARLESEL:
+					{
+						Selectivity pair_s2 = s2;
+
+						(void) get_last_scalarineqsel_nongrowth(&pair_s2);
 						addRangeClause(&rqlist, clause,
-									   varonleft, true, s2);
+									   varonleft, true, s2, pair_s2);
 						break;
+					}
 					case F_SCALARGTSEL:
 					case F_SCALARGESEL:
+					{
+						Selectivity pair_s2 = s2;
+
+						(void) get_last_scalarineqsel_nongrowth(&pair_s2);
 						addRangeClause(&rqlist, clause,
-									   varonleft, false, s2);
+									   varonleft, false, s2, pair_s2);
 						break;
+					}
 					default:
 						/* Just merge the selectivity in generically */
 						s1 = s1 * s2;
@@ -281,68 +302,32 @@ clauselist_selectivity_ext(PlannerInfo *root,
 		{
 			/* Successfully matched a pair of range clauses */
 			Selectivity s2;
-			Selectivity lobound = rqlist->lobound;
-			Selectivity hibound = rqlist->hibound;
+			Selectivity growth_lobound = rqlist->lobound;
+			Selectivity growth_hibound = rqlist->hibound;
 
 			if (rqlist->lobound_clause != NULL)
-				(void) get_range_pair_extrapolated_sel(root,
-													   rqlist->lobound_clause,
-													   varRelid,
-													   rqlist->lobound_varonleft,
-													   &lobound);
+				(void) get_range_pair_selectivity(root, rqlist->lobound_clause,
+												  varRelid,
+												  rqlist->lobound_varonleft,
+												  true,
+												  &growth_lobound);
 			if (rqlist->hibound_clause != NULL)
-				(void) get_range_pair_extrapolated_sel(root,
-													   rqlist->hibound_clause,
-													   varRelid,
-													   rqlist->hibound_varonleft,
-													   &hibound);
+				(void) get_range_pair_selectivity(root, rqlist->hibound_clause,
+												  varRelid,
+												  rqlist->hibound_varonleft,
+												  true,
+												  &growth_hibound);
 
-			/*
-			 * Exact equality to the default value probably means the
-			 * selectivity function punted.  This is not airtight but should
-			 * be good enough.
-			 */
-			if (hibound == DEFAULT_INEQ_SEL ||
-				lobound == DEFAULT_INEQ_SEL)
-			{
-				s2 = DEFAULT_RANGE_INEQ_SEL;
-			}
-			else
-			{
-				s2 = hibound + lobound - 1.0;
-
-				/* Adjust for double-exclusion of NULLs */
-				s2 += nulltestsel(root, IS_NULL, rqlist->var,
-								  varRelid, jointype, sjinfo);
-
-				/*
-				 * A zero or slightly negative s2 should be converted into a
-				 * small positive value; we probably are dealing with a very
-				 * tight range and got a bogus result due to roundoff errors.
-				 * However, if s2 is very negative, then we probably have
-				 * default selectivity estimates on one or both sides of the
-				 * range that we failed to recognize above for some reason.
-				 */
-				if (s2 <= 0.0)
-				{
-					if (s2 < -0.01)
-					{
-						/*
-						 * No data available --- use a default estimate that
-						 * is small, but not real small.
-						 */
-						s2 = DEFAULT_RANGE_INEQ_SEL;
-					}
-					else
-					{
-						/*
-						 * It's just roundoff error; use a small positive
-						 * value
-						 */
-						s2 = 1.0e-10;
-					}
-				}
-			}
+			s2 = combine_range_pair_selectivity(root, rqlist,
+												rqlist->pair_lobound,
+												rqlist->pair_hibound,
+												varRelid, jointype, sjinfo);
+			s2 = Max(s2,
+					 combine_range_pair_selectivity(root, rqlist,
+													growth_lobound,
+													growth_hibound,
+													varRelid, jointype,
+													sjinfo));
 			/* Merge in the selectivity of the pair of clauses */
 			s1 *= s2;
 		}
@@ -447,7 +432,8 @@ clauselist_selectivity_or(PlannerInfo *root,
  */
 static void
 addRangeClause(RangeQueryClause **rqlist, Node *clause,
-			   bool varonleft, bool isLTsel, Selectivity s2)
+			   bool varonleft, bool isLTsel,
+			   Selectivity s2, Selectivity pair_s2)
 {
 	RangeQueryClause *rqelem;
 	Node	   *var;
@@ -479,6 +465,7 @@ addRangeClause(RangeQueryClause **rqlist, Node *clause,
 			{
 				rqelem->have_lobound = true;
 				rqelem->lobound = s2;
+				rqelem->pair_lobound = pair_s2;
 				rqelem->lobound_clause = clause;
 				rqelem->lobound_varonleft = varonleft;
 			}
@@ -494,6 +481,7 @@ addRangeClause(RangeQueryClause **rqlist, Node *clause,
 				if (rqelem->lobound > s2)
 				{
 					rqelem->lobound = s2;
+					rqelem->pair_lobound = pair_s2;
 					rqelem->lobound_clause = clause;
 					rqelem->lobound_varonleft = varonleft;
 				}
@@ -505,6 +493,7 @@ addRangeClause(RangeQueryClause **rqlist, Node *clause,
 			{
 				rqelem->have_hibound = true;
 				rqelem->hibound = s2;
+				rqelem->pair_hibound = pair_s2;
 				rqelem->hibound_clause = clause;
 				rqelem->hibound_varonleft = varonleft;
 			}
@@ -520,6 +509,7 @@ addRangeClause(RangeQueryClause **rqlist, Node *clause,
 				if (rqelem->hibound > s2)
 				{
 					rqelem->hibound = s2;
+					rqelem->pair_hibound = pair_s2;
 					rqelem->hibound_clause = clause;
 					rqelem->hibound_varonleft = varonleft;
 				}
@@ -536,6 +526,7 @@ addRangeClause(RangeQueryClause **rqlist, Node *clause,
 		rqelem->have_lobound = true;
 		rqelem->have_hibound = false;
 		rqelem->lobound = s2;
+		rqelem->pair_lobound = pair_s2;
 		rqelem->lobound_clause = clause;
 		rqelem->lobound_varonleft = varonleft;
 		rqelem->hibound_clause = NULL;
@@ -545,6 +536,7 @@ addRangeClause(RangeQueryClause **rqlist, Node *clause,
 		rqelem->have_lobound = false;
 		rqelem->have_hibound = true;
 		rqelem->hibound = s2;
+		rqelem->pair_hibound = pair_s2;
 		rqelem->hibound_clause = clause;
 		rqelem->hibound_varonleft = varonleft;
 		rqelem->lobound_clause = NULL;
@@ -554,9 +546,10 @@ addRangeClause(RangeQueryClause **rqlist, Node *clause,
 }
 
 static bool
-get_range_pair_extrapolated_sel(PlannerInfo *root, Node *clause,
-								   int varRelid, bool varonleft,
-								   Selectivity *s2)
+get_range_pair_selectivity(PlannerInfo *root, Node *clause,
+						   int varRelid, bool varonleft,
+						   bool use_growth_model,
+						   Selectivity *s2)
 {
 	OpExpr			   *expr = (OpExpr *) clause;
 	Node			   *var;
@@ -616,9 +609,41 @@ get_range_pair_extrapolated_sel(PlannerInfo *root, Node *clause,
 	*s2 = scalarineqsel_for_range_pair(root, opno, isgt, iseq,
 									   expr->inputcollid, &vardata,
 									   ((Const *) other)->constvalue,
-									   ((Const *) other)->consttype);
+									   ((Const *) other)->consttype,
+									   use_growth_model);
 	ReleaseVariableStats(vardata);
 	return true;
+}
+
+static Selectivity
+combine_range_pair_selectivity(PlannerInfo *root,
+							   RangeQueryClause *rqlist,
+							   Selectivity lobound,
+							   Selectivity hibound,
+							   int varRelid,
+							   JoinType jointype,
+							   SpecialJoinInfo *sjinfo)
+{
+	Selectivity s2;
+
+	if (hibound == DEFAULT_INEQ_SEL || lobound == DEFAULT_INEQ_SEL)
+		return DEFAULT_RANGE_INEQ_SEL;
+
+	s2 = hibound + lobound - 1.0;
+
+	/* Adjust for double-exclusion of NULLs */
+	s2 += nulltestsel(root, IS_NULL, rqlist->var,
+					  varRelid, jointype, sjinfo);
+
+	if (s2 <= 0.0)
+	{
+		if (s2 < -0.01)
+			return DEFAULT_RANGE_INEQ_SEL;
+
+		return 1.0e-10;
+	}
+
+	return s2;
 }
 
 /*

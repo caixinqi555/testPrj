@@ -200,7 +200,9 @@ extern double scalarineqsel_for_range_pair(PlannerInfo *root,
 										   Oid collation,
 										   VariableStatData *vardata,
 										   Datum constval,
-										   Oid consttype);
+										   Oid consttype,
+										   bool use_growth_model);
+extern bool get_last_scalarineqsel_nongrowth(double *selec);
 extern double var_eq_const(VariableStatData *vardata,
 						   Oid oproid, Oid collation,
 						   Datum constval, bool constisnull,

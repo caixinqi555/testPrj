@@ -245,12 +245,12 @@ static double convert_timevalue_to_scalar(Datum value, Oid typid,
 static Node *strip_all_phvs_deep(PlannerInfo *root, Node *node);
 static bool contain_placeholder_walker(Node *node, void *context);
 static Node *strip_all_phvs_mutator(Node *node, void *context);
-static double scalarineqsel_internal(PlannerInfo *root, Oid operator,
-									 bool isgt, bool iseq,
-									 Oid collation,
-									 VariableStatData *vardata,
-									 Datum constval, Oid consttype,
-									 bool allow_extrapolation);
+static double scalarineqsel_nongrowth(PlannerInfo *root, Oid operator,
+									  bool isgt, bool iseq,
+									  Oid collation,
+									  VariableStatData *vardata,
+									  Datum constval, Oid consttype,
+									  double *hist_weight);
 static void examine_simple_variable(PlannerInfo *root, Var *var,
 									VariableStatData *vardata);
 static void examine_indexcol_variable(PlannerInfo *root, IndexOptInfo *index,
@@ -278,13 +278,23 @@ static bool get_actual_variable_endpoint(Relation heapRel,
 static RelOptInfo *find_join_input_rel(PlannerInfo *root, Relids relids);
 static double btcost_correlation(IndexOptInfo *index,
 								 VariableStatData *vardata);
+static double scalarineqsel_growth_model(PlannerInfo *root,
+										 VariableStatData *vardata,
+										 Oid opoid, FmgrInfo *opproc,
+										 bool isgt,
+										 Oid collation,
+										 Datum constval, Oid consttype,
+										 double old_selec,
+										 double hist_weight);
 static double ineq_histogram_selectivity_worker(PlannerInfo *root,
 												 VariableStatData *vardata,
 												 Oid opoid, FmgrInfo *opproc,
 												 bool isgt, bool iseq,
 												 Oid collation,
-												 Datum constval, Oid consttype,
-												 bool allow_extrapolation);
+												 Datum constval, Oid consttype);
+
+static bool have_last_scalarineqsel_nongrowth = false;
+static double last_scalarineqsel_nongrowth = DEFAULT_INEQ_SEL;
 
 /* Define support routines for MCV hash tables */
 #define SH_PREFIX				MCVHashTable
@@ -667,8 +677,38 @@ scalarineqsel(PlannerInfo *root, Oid operator, bool isgt, bool iseq,
 			  Oid collation,
 			  VariableStatData *vardata, Datum constval, Oid consttype)
 {
-	return scalarineqsel_internal(root, operator, isgt, iseq, collation,
-								  vardata, constval, consttype, false);
+	double		selec,
+				hist_weight,
+				growth_selec;
+
+	have_last_scalarineqsel_nongrowth = false;
+	selec = scalarineqsel_nongrowth(root, operator, isgt, iseq, collation,
+									vardata, constval, consttype,
+									&hist_weight);
+	last_scalarineqsel_nongrowth = selec;
+	have_last_scalarineqsel_nongrowth = true;
+	if (selec == DEFAULT_INEQ_SEL)
+		return selec;
+
+	growth_selec = scalarineqsel_growth_model(root, vardata, operator,
+											  NULL, isgt, collation,
+											  constval, consttype, selec,
+											  hist_weight);
+	if (growth_selec >= 0.0)
+		selec = Max(selec, growth_selec);
+
+	CLAMP_PROBABILITY(selec);
+	return selec;
+}
+
+bool
+get_last_scalarineqsel_nongrowth(double *selec)
+{
+	if (!have_last_scalarineqsel_nongrowth)
+		return false;
+
+	*selec = last_scalarineqsel_nongrowth;
+	return true;
 }
 
 double
@@ -676,17 +716,36 @@ scalarineqsel_for_range_pair(PlannerInfo *root, Oid operator,
 							   bool isgt, bool iseq,
 							   Oid collation,
 							   VariableStatData *vardata,
-							   Datum constval, Oid consttype)
+							   Datum constval, Oid consttype,
+							   bool use_growth_model)
 {
-	return scalarineqsel_internal(root, operator, isgt, iseq, collation,
-								  vardata, constval, consttype, true);
+	FmgrInfo	opproc;
+	double		selec,
+				hist_weight,
+				growth_selec;
+
+	selec = scalarineqsel_nongrowth(root, operator, isgt, iseq, collation,
+									vardata, constval, consttype,
+									&hist_weight);
+	if (!use_growth_model || selec == DEFAULT_INEQ_SEL)
+		return selec;
+
+	fmgr_info(get_opcode(operator), &opproc);
+	growth_selec = scalarineqsel_growth_model(root, vardata, operator,
+											  &opproc, isgt, collation,
+											  constval, consttype, selec,
+											  hist_weight);
+	if (growth_selec >= 0.0)
+		return growth_selec;
+
+	return selec;
 }
 
 static double
-scalarineqsel_internal(PlannerInfo *root, Oid operator, bool isgt, bool iseq,
-					   Oid collation,
-					   VariableStatData *vardata, Datum constval, Oid consttype,
-					   bool allow_extrapolation)
+scalarineqsel_nongrowth(PlannerInfo *root, Oid operator, bool isgt, bool iseq,
+						Oid collation,
+						VariableStatData *vardata, Datum constval, Oid consttype,
+						double *hist_weight)
 {
 	Form_pg_statistic stats;
 	FmgrInfo	opproc;
@@ -773,6 +832,8 @@ scalarineqsel_internal(PlannerInfo *root, Oid operator, bool isgt, bool iseq,
 		}
 
 		/* no stats available, so default result */
+		if (hist_weight)
+			*hist_weight = -1.0;
 		return DEFAULT_INEQ_SEL;
 	}
 	stats = (Form_pg_statistic) GETSTRUCT(vardata->statsTuple);
@@ -795,15 +856,15 @@ scalarineqsel_internal(PlannerInfo *root, Oid operator, bool isgt, bool iseq,
 	hist_selec = ineq_histogram_selectivity_worker(root, vardata,
 												   operator, &opproc,
 												   isgt, iseq, collation,
-												   constval, consttype,
-												   allow_extrapolation);
+												   constval, consttype);
 
 	/*
 	 * Now merge the results from the MCV and histogram calculations,
 	 * realizing that the histogram covers only the non-null values that are
 	 * not listed in MCV.
 	 */
-	selec = 1.0 - stats->stanullfrac - sumcommon;
+	*hist_weight = 1.0 - stats->stanullfrac - sumcommon;
+	selec = *hist_weight;
 
 	if (hist_selec >= 0.0)
 		selec *= hist_selec;
@@ -818,18 +879,136 @@ scalarineqsel_internal(PlannerInfo *root, Oid operator, bool isgt, bool iseq,
 
 	selec += mcv_selec;
 
-	if (allow_extrapolation)
+	return selec;
+}
+
+/*
+ * Estimate a "growth column" variant of a scalar inequality by assuming rows
+ * inserted since the last ANALYZE extend the histogram's right tail.
+ *
+ * The planner already scales baserel->tuples using current relpages versus the
+ * relpages seen by ANALYZE.  We treat that delta as newly inserted rows,
+ * estimate how wide a continuation of the histogram's rightmost buckets those
+ * rows would occupy, and then compute a second selectivity under that model.
+ * Callers can compare this to the ordinary non-growth estimate and keep the
+ * larger one.
+ */
+static double
+scalarineqsel_growth_model(PlannerInfo *root,
+						   VariableStatData *vardata,
+						   Oid opoid, FmgrInfo *opproc,
+						   bool isgt,
+						   Oid collation,
+						   Datum constval, Oid consttype,
+						   double old_selec,
+						   double hist_weight)
+{
+	RangeTblEntry *rte;
+	Relation	rel;
+	AttStatsSlot sslot;
+	double		current_rows;
+	double		old_rows;
+	double		growth_rows;
+	double		old_tail_rows;
+	double		val,
+				tail_low,
+				tail_high;
+	double		tail_width,
+				tail_selec,
+				growth_selec;
+	int			tail_buckets;
+	int			total_buckets;
+
+	if (root == NULL || vardata->rel == NULL || !IS_SIMPLE_REL(vardata->rel))
+		return -1.0;
+
+	current_rows = vardata->rel->tuples;
+	if (current_rows <= 0.0 || hist_weight <= 0.0)
+		return -1.0;
+
+	rte = planner_rt_fetch(vardata->rel->relid, root);
+	if (rte->rtekind != RTE_RELATION)
+		return -1.0;
+
+	rel = table_open(rte->relid, NoLock);
+	old_rows = rel->rd_rel->reltuples;
+	table_close(rel, NoLock);
+
+	if (old_rows <= 0.0 || old_rows >= current_rows)
+		return -1.0;
+
+	if (opproc == NULL)
 	{
-		if (selec < 0.0 || isnan(selec))
-			selec = 0.0;
+		FmgrInfo	local_opproc;
+
+		fmgr_info(get_opcode(opoid), &local_opproc);
+		opproc = &local_opproc;
+	}
+
+	if (!statistic_proc_security_check(vardata, opproc->fn_oid) ||
+		!get_attstatsslot(&sslot, vardata->statsTuple,
+						  STATISTIC_KIND_HISTOGRAM, InvalidOid,
+						  ATTSTATSSLOT_VALUES))
+		return -1.0;
+
+	if (sslot.nvalues <= 1 ||
+		sslot.stacoll != collation ||
+		!comparison_ops_are_compatible(sslot.staop, opoid))
+	{
+		free_attstatsslot(&sslot);
+		return -1.0;
+	}
+
+	tail_buckets = Min(3, sslot.nvalues - 1);
+	total_buckets = sslot.nvalues - 1;
+	if (!convert_to_scalar(constval, consttype, collation, &val,
+						   sslot.values[sslot.nvalues - 1 - tail_buckets],
+						   sslot.values[sslot.nvalues - 1],
+						   vardata->vartype,
+						   &tail_low, &tail_high))
+	{
+		free_attstatsslot(&sslot);
+		return -1.0;
+	}
+	free_attstatsslot(&sslot);
+
+	if (tail_high <= tail_low)
+		return -1.0;
+
+	growth_rows = current_rows - old_rows;
+	old_tail_rows = old_rows * hist_weight *
+		((double) tail_buckets / (double) total_buckets);
+	if (old_tail_rows <= 0.0)
+		return -1.0;
+
+	tail_width = (tail_high - tail_low) * growth_rows / old_tail_rows;
+	if (tail_width <= 0.0 || isnan(tail_width) || isinf(tail_width))
+		return -1.0;
+
+	if (isgt)
+	{
+		if (val <= tail_high)
+			tail_selec = 1.0;
+		else if (val >= tail_high + tail_width)
+			tail_selec = 0.0;
+		else
+			tail_selec = 1.0 - ((val - tail_high) / tail_width);
 	}
 	else
 	{
-		/* result should be in range, but make sure... */
-		CLAMP_PROBABILITY(selec);
+		if (val <= tail_high)
+			tail_selec = 0.0;
+		else if (val >= tail_high + tail_width)
+			tail_selec = 1.0;
+		else
+			tail_selec = (val - tail_high) / tail_width;
 	}
 
-	return selec;
+	growth_selec = ((old_rows * old_selec) + (growth_rows * tail_selec)) /
+		current_rows;
+	CLAMP_PROBABILITY(growth_selec);
+
+	return growth_selec;
 }
 
 /*
@@ -1162,7 +1341,7 @@ ineq_histogram_selectivity(PlannerInfo *root,
 {
 	return ineq_histogram_selectivity_worker(root, vardata, opoid, opproc,
 											 isgt, iseq, collation,
-											 constval, consttype, false);
+											 constval, consttype);
 }
 
 static double
@@ -1171,8 +1350,7 @@ ineq_histogram_selectivity_worker(PlannerInfo *root,
 								  Oid opoid, FmgrInfo *opproc,
 								  bool isgt, bool iseq,
 								  Oid collation,
-								  Datum constval, Oid consttype,
-								  bool allow_extrapolation)
+								  Datum constval, Oid consttype)
 {
 	double		hist_selec;
 	AttStatsSlot sslot;
@@ -1223,7 +1401,6 @@ ineq_histogram_selectivity_worker(PlannerInfo *root,
 			int			lobound = 0;	/* first possible slot to search */
 			int			hibound = sslot.nvalues;	/* last+1 slot to search */
 			bool		have_end = false;
-			bool		extrapolated = false;
 
 			/*
 			 * If there are only two histogram entries, we'll want up-to-date
@@ -1278,68 +1455,22 @@ ineq_histogram_selectivity_worker(PlannerInfo *root,
 
 			if (lobound <= 0)
 			{
-				if (allow_extrapolation)
-				{
-					/*
-					 * Constant is below the lower histogram boundary.
-					 * Estimate its relative position by extrapolating against
-					 * the overall histogram span, so range-clause pairing can
-					 * preserve how far the query extends beyond the sampled
-					 * minimum.
-					 */
-					double		val,
-								high,
-								low;
-
-					extrapolated = true;
-					if (convert_to_scalar(constval, consttype, collation,
-										  &val,
-										  sslot.values[0],
-										  sslot.values[sslot.nvalues - 1],
-										  vardata->vartype,
-										  &low, &high) &&
-						high > low)
-					{
-						histfrac = (val - low) / (high - low);
-						if (isnan(histfrac) || isinf(histfrac))
-							histfrac = 0.0;
-					}
-					else
-						histfrac = 0.0;
-				}
-				else
-					histfrac = 0.0;
+				/*
+				 * Constant is below lower histogram boundary.  More
+				 * precisely, we have found that no entry in the histogram
+				 * satisfies the inequality clause (if !isgt) or they all do
+				 * (if isgt).  We estimate that that's true of the entire
+				 * table, so set histfrac to 0.0 (which we'll flip to 1.0
+				 * below, if isgt).
+				 */
+				histfrac = 0.0;
 			}
 			else if (lobound >= sslot.nvalues)
 			{
-				if (allow_extrapolation)
-				{
-					/*
-					 * Inverse case: constant is above the upper histogram
-					 * boundary.
-					 */
-					double		val,
-								high,
-								low;
-
-					extrapolated = true;
-					if (convert_to_scalar(constval, consttype, collation,
-										  &val,
-										  sslot.values[0],
-										  sslot.values[sslot.nvalues - 1],
-										  vardata->vartype,
-										  &low, &high) &&
-						high > low)
-					{
-						histfrac = (val - low) / (high - low);
-						if (isnan(histfrac) || isinf(histfrac))
-							histfrac = 1.0;
-					}
-					else
-						histfrac = 1.0;
-				}
-				else
-					histfrac = 1.0;
+				/*
+				 * Inverse case: constant is above upper histogram boundary.
+				 */
+				histfrac = 1.0;
 			}
 			else
 			{
@@ -1498,27 +1629,25 @@ ineq_histogram_selectivity_worker(PlannerInfo *root,
 			hist_selec = isgt ? (1.0 - histfrac) : histfrac;
 
 			/*
-			 * Only clamp interior estimates.  For bounds beyond the sampled
-			 * endpoints we intentionally preserve how far outside the
-			 * histogram they fall, so range-clause pairing can extrapolate
-			 * row counts from the query span.
+			 * The histogram boundaries are only approximate to begin with,
+			 * and may well be out of date anyway.  Therefore, don't believe
+			 * extremely small or large selectivity estimates --- unless we
+			 * got actual current endpoint values from the table, in which
+			 * case just do the usual sanity clamp.  Somewhat arbitrarily, we
+			 * set the cutoff for other cases at a hundredth of the histogram
+			 * resolution.
 			 */
-			if (!allow_extrapolation || !extrapolated)
+			if (have_end)
+				CLAMP_PROBABILITY(hist_selec);
+			else
 			{
-				if (have_end)
-					CLAMP_PROBABILITY(hist_selec);
-				else
-				{
-					double		cutoff = 0.01 / (double) (sslot.nvalues - 1);
+				double		cutoff = 0.01 / (double) (sslot.nvalues - 1);
 
-					if (hist_selec < cutoff)
-						hist_selec = cutoff;
-					else if (hist_selec > 1.0 - cutoff)
-						hist_selec = 1.0 - cutoff;
-				}
+				if (hist_selec < cutoff)
+					hist_selec = cutoff;
+				else if (hist_selec > 1.0 - cutoff)
+					hist_selec = 1.0 - cutoff;
 			}
-			else if (hist_selec < 0.0 || isnan(hist_selec))
-				hist_selec = 0.0;
 		}
 		else if (sslot.nvalues > 1)
 		{
