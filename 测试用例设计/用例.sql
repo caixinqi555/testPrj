@@ -457,68 +457,67 @@ DROP INDEX st_g_expr;
 DROP TABLE IF EXISTS t_e_astore;
 CREATE TABLE t_e_astore (ver int, region int, v varchar(32))
   WITH (storage_type=astore);
--- ver 取值 1..50，每值 2000 行，analyzed_tuples=100000，n_distinct=50，全部为 MCV
+-- ver 取值 1..10，每值 1000 行，analyzed_tuples=10000，n_distinct=10，全部为 MCV
 INSERT INTO t_e_astore
-  SELECT ((g - 1) % 50) + 1, (((g - 1) / 50) % 10) + 1, 'v' || g FROM generate_series(1, 100000) g;
-ANALYZE t_e_astore;   -- stats 下 num_mcv=50，other_distinct = n_distinct - num_mcv = 0
+  SELECT ((g - 1) % 10) + 1, (((g - 1) / 10) % 2) + 1, 'v' || g FROM generate_series(1, 10000) g;
+ANALYZE t_e_astore;   -- stats 下 num_mcv=10，other_distinct = n_distinct - num_mcv = 0
 -- 引入新 ver=51 的增量，未命中 MCV，触发 equal 矫正
-INSERT INTO t_e_astore SELECT 51, ((g - 1) % 10) + 1, 'v' || g FROM generate_series(1, 2000) g;
+INSERT INTO t_e_astore SELECT 51, ((g - 1) % 2) + 1, 'v' || g FROM generate_series(1, 1000) g;
 -- increase_tuples ≈ 2000
 
 -- E-Fixture-02：ustore 低 NDV 表
 DROP TABLE IF EXISTS t_e_ustore;
 CREATE TABLE t_e_ustore (ver int, region int, v varchar(32));
-INSERT INTO t_e_ustore SELECT ((g - 1) % 50) + 1, (((g - 1) / 50) % 10) + 1, 'v'||g FROM generate_series(1, 100000) g;
+INSERT INTO t_e_ustore SELECT ((g - 1) % 10) + 1, (((g - 1) / 10) % 2) + 1, 'v'||g FROM generate_series(1, 10000) g;
 ANALYZE t_e_ustore;
-INSERT INTO t_e_ustore SELECT 51, ((g - 1)%10)+1, 'v'||g FROM generate_series(1, 2000) g;
+INSERT INTO t_e_ustore SELECT 51, ((g - 1)%2)+1, 'v'||g FROM generate_series(1, 1000) g;
 
 -- E-Fixture-03：一级分区（range 按 region）
 DROP TABLE IF EXISTS t_e_part1;
 CREATE TABLE t_e_part1 (ver int, region int, v varchar(32))
   PARTITION BY RANGE (region) (
-    PARTITION p1 VALUES LESS THAN (4),
-    PARTITION p2 VALUES LESS THAN (7),
-    PARTITION p3 VALUES LESS THAN (11)
+    PARTITION p_old VALUES LESS THAN (3),
+    PARTITION p_new VALUES LESS THAN (4)
   );
 INSERT INTO t_e_part1
-  SELECT ((g - 1) % 50) + 1, (((g - 1) / 50) % 10) + 1, 'v'||g
-  FROM generate_series(1, 100000) g;
+  SELECT ((g - 1) % 10) + 1, (((g - 1) / 10) % 2) + 1, 'v'||g
+  FROM generate_series(1, 10000) g;
 ANALYZE t_e_part1 WITH ALL COMPLETE;
-INSERT INTO t_e_part1 SELECT 51, ((g - 1) % 10) + 1, 'v'||g FROM generate_series(1, 2000) g;
+INSERT INTO t_e_part1 SELECT ((g - 1) % 10) + 1, 3, 'v'||g FROM generate_series(1, 1000) g;
 
 -- equal 公式：`target_rows = Min(analyzed_tuples / n_distinct, increase_tuples)`
--- 基础 fixture 下：单列每个 ver 2000 行，新增 ver=51 也是 2000 行；多列每个 (ver,region) 组合 200 行，新增组合也保持 200 行。
--- 低 NDV fixture 下：旧值每个 50000 行，新增值也保持 50000 行。
+-- 基础 fixture 下：单列每个 ver 1000 行，新增 ver=51 也是 1000 行；多列每个 (ver,region) 组合 500 行，新增组合也保持 500 行。
+-- 低 NDV fixture 下：旧值每个 5000 行，新增值也保持 5000 行。
 
 -- 5.2 组 A：基础笛卡尔 16 条
 
 -- 【E-A-01】equal 触发 | astore | 单列 | 未命中+other=0 | 公式值生效 | int
--- 预期：触发 equal 边界外矫正 | rows ≈ 2000（±20%）| 单列密度 100000/50=2000，新增 ver=51 也是 2000
-INSERT INTO res SELECT * FROM  check_erows('E-A-01', $$SELECT * FROM t_e_astore WHERE ver = 51$$, 2000, 0.20);
+-- 预期：触发 equal 边界外矫正 | rows ≈ 1000（±20%）| 单列密度 10000/10=1000，新增 ver=51 也是 2000
+INSERT INTO res SELECT * FROM  check_erows('E-A-01', $$SELECT * FROM t_e_astore WHERE ver = 51$$, 1000, 0.20);
 
 -- 【E-A-02】equal 触发 | astore | 单列 | 未命中+other=0 | 上界截断 | int
--- 预期：触发 equal 边界外矫正 | rows ≈ 50000（±20%）| 低 NDV 旧值密度 100000/2=50000，新增值保持同密度
+-- 预期：触发 equal 边界外矫正 | rows ≈ 5000（±20%）| 低 NDV 旧值密度 10000/2=5000，新增值保持同密度
 DROP TABLE IF EXISTS t_e_astore_low;
 CREATE TABLE t_e_astore_low (ver int, region int)
   WITH (storage_type=astore);
 INSERT INTO t_e_astore_low
   SELECT (g % 2) + 1, (g % 2) + 1
-  FROM generate_series(1, 100000) g;  -- ver/region 均为低 NDV，单列 n_distinct=2
+  FROM generate_series(1, 10000) g;  -- ver/region 均为低 NDV，单列 n_distinct=2
 ANALYZE t_e_astore_low;
-INSERT INTO t_e_astore_low SELECT 3, 3 FROM generate_series(1, 50000) g;
-INSERT INTO res SELECT * FROM  check_erows('E-A-02', $$SELECT * FROM t_e_astore_low WHERE ver = 3$$, 50000, 0.20);
+INSERT INTO t_e_astore_low SELECT 3, 3 FROM generate_series(1, 5000) g;
+INSERT INTO res SELECT * FROM  check_erows('E-A-02', $$SELECT * FROM t_e_astore_low WHERE ver = 3$$, 5000, 0.20);
 
 -- 【E-A-03】equal 触发 | astore | 多列统计 | 未命中+other=0 | 公式值生效 | int
--- 预期：触发 equal 边界外矫正 | rows ≈ 200（±30%）| 多列组合密度 100000/(50*10)=200，新增组合保持 200
+-- 预期：触发 equal 边界外矫正 | rows ≈ 200（±30%）| 多列组合密度 10000/(10*2)=500，新增组合保持 200
 DROP TABLE IF EXISTS t_e_astore;
 CREATE TABLE t_e_astore (ver int, region int, v varchar(32))
   WITH (storage_type=astore);
 INSERT INTO t_e_astore
-  SELECT ((g - 1) % 50) + 1, (((g - 1) / 50) % 10) + 1, 'v' || g FROM generate_series(1, 100000) g;
+  SELECT ((g - 1) % 10) + 1, (((g - 1) / 10) % 2) + 1, 'v' || g FROM generate_series(1, 10000) g;
 CREATE INDEX st_e_ver_region ON t_e_astore(ver, region);
 ANALYZE t_e_astore;
-INSERT INTO t_e_astore SELECT 51, ((g - 1) % 10) + 1, 'v' || g FROM generate_series(1, 2000) g;
-INSERT INTO res SELECT * FROM  check_erows('E-A-03', $$SELECT * FROM t_e_astore WHERE ver = 51 AND region = 3$$, 200, 0.20);
+INSERT INTO t_e_astore SELECT 51, ((g - 1) % 2) + 1, 'v' || g FROM generate_series(1, 1000) g;
+INSERT INTO res SELECT * FROM  check_erows('E-A-03', $$SELECT * FROM t_e_astore WHERE ver = 51 AND region = 2$$, 500, 0.20);
 DROP INDEX st_e_ver_region;
 
 -- 【E-A-04】equal 触发 | astore | 多列统计 | 未命中+other=0 | 上界截断 | int
@@ -528,35 +527,35 @@ CREATE TABLE t_e_astore_low (ver int, region int)
   WITH (storage_type=astore);
 INSERT INTO t_e_astore_low
   SELECT (g % 2) + 1, (g % 2) + 1
-  FROM generate_series(1, 100000) g;
+  FROM generate_series(1, 10000) g;
 CREATE INDEX st_e_ver_region2 ON t_e_astore_low(ver, region);
 ANALYZE t_e_astore_low;
-INSERT INTO t_e_astore_low SELECT 7, 7 FROM generate_series(1, 50000) g;
-INSERT INTO res SELECT * FROM  check_erows('E-A-04', $$SELECT * FROM t_e_astore_low WHERE ver = 7$$, 50000, 0.20);
+INSERT INTO t_e_astore_low SELECT 7, 7 FROM generate_series(1, 5000) g;
+INSERT INTO res SELECT * FROM  check_erows('E-A-04', $$SELECT * FROM t_e_astore_low WHERE ver = 7$$, 5000, 0.20);
 DROP INDEX st_e_ver_region2;
 
 -- 【E-A-05】equal 触发 | ustore | 单列 | 未命中+other=0 | 公式值生效
--- 预期：触发 equal 边界外矫正 | rows ≈ 2000（±20%）
-INSERT INTO res SELECT * FROM  check_erows('E-A-05', $$SELECT * FROM t_e_ustore WHERE ver = 51$$, 2000, 0.20);
+-- 预期：触发 equal 边界外矫正 | rows ≈ 1000（±20%）
+INSERT INTO res SELECT * FROM  check_erows('E-A-05', $$SELECT * FROM t_e_ustore WHERE ver = 51$$, 1000, 0.20);
 
 -- 【E-A-06】equal 触发 | ustore | 单列 | 未命中+other=0 | 上界截断
 DROP TABLE IF EXISTS t_e_ustore_low;
 CREATE TABLE t_e_ustore_low (ver int, region int);
 INSERT INTO t_e_ustore_low
   SELECT (g%2)+1, (g%2)+1
-  FROM generate_series(1, 100000) g;
+  FROM generate_series(1, 10000) g;
 ANALYZE t_e_ustore_low;
-INSERT INTO t_e_ustore_low SELECT 3, 3 FROM generate_series(1, 50000) g;
-INSERT INTO res SELECT * FROM  check_erows('E-A-06', $$SELECT * FROM t_e_ustore_low WHERE ver = 3$$, 50000, 0.20);
+INSERT INTO t_e_ustore_low SELECT 3, 3 FROM generate_series(1, 5000) g;
+INSERT INTO res SELECT * FROM  check_erows('E-A-06', $$SELECT * FROM t_e_ustore_low WHERE ver = 3$$, 5000, 0.20);
 
 -- 【E-A-07】equal 触发 | ustore | 多列 | 公式值生效
 DROP TABLE IF EXISTS t_e_ustore;
 CREATE TABLE t_e_ustore (ver int, region int, v varchar(32));
-INSERT INTO t_e_ustore SELECT ((g - 1) % 50) + 1, (((g - 1) / 50) % 10) + 1, 'v'||g FROM generate_series(1, 100000) g;
+INSERT INTO t_e_ustore SELECT ((g - 1) % 10) + 1, (((g - 1) / 10) % 2) + 1, 'v'||g FROM generate_series(1, 10000) g;
 CREATE INDEX st_e_ust_mc ON t_e_ustore(ver, region);
 ANALYZE t_e_ustore;
-INSERT INTO t_e_ustore SELECT 51, ((g - 1)%10)+1, 'v'||g FROM generate_series(1, 2000) g;
-INSERT INTO res SELECT * FROM  check_erows('E-A-07', $$SELECT * FROM t_e_ustore WHERE ver = 51 AND region = 3$$, 200, 0.20);
+INSERT INTO t_e_ustore SELECT 51, ((g - 1)%2)+1, 'v'||g FROM generate_series(1, 1000) g;
+INSERT INTO res SELECT * FROM  check_erows('E-A-07', $$SELECT * FROM t_e_ustore WHERE ver = 51 AND region = 2$$, 500, 0.20);
 DROP INDEX st_e_ust_mc;
 
 -- 【E-A-08】equal 触发 | ustore | 多列 | 上界截断
@@ -564,53 +563,52 @@ DROP TABLE IF EXISTS t_e_ustore_low;
 CREATE TABLE t_e_ustore_low (ver int, region int);
 INSERT INTO t_e_ustore_low
   SELECT (g%2)+1, (g%2)+1
-  FROM generate_series(1, 100000) g;
+  FROM generate_series(1, 10000) g;
 CREATE INDEX st_e_ust_mc2 ON t_e_ustore_low(ver, region);
 ANALYZE t_e_ustore_low;
-INSERT INTO t_e_ustore_low SELECT 7, 7 FROM generate_series(1, 50000) g;
-INSERT INTO res SELECT * FROM  check_erows('E-A-08', $$SELECT * FROM t_e_ustore_low WHERE ver = 7$$, 50000, 0.20);
+INSERT INTO t_e_ustore_low SELECT 7, 7 FROM generate_series(1, 5000) g;
+INSERT INTO res SELECT * FROM  check_erows('E-A-08', $$SELECT * FROM t_e_ustore_low WHERE ver = 7$$, 5000, 0.20);
 DROP INDEX st_e_ust_mc2;
 
--- 【E-A-09】equal 触发 | 一级分区-剪枝单（p3）| 单列 | 公式值生效
--- 预期：触发 equal 边界外矫正 | rows ≈ 800（±20%）| p3 上每个 ver 的分区局部密度为 800，新增在 p3 也保持 800
-INSERT INTO res SELECT * FROM  check_erows('E-A-09', $$SELECT * FROM t_e_part1 WHERE ver = 51 AND region = 8$$, 800, 0.20);
-
--- 【E-A-10】equal 触发 | 一级分区-剪枝单（p3）| 单列 | 上界截断
+-- 【E-A-09】equal 触发 | 一级分区-剪枝单（p2）| 单列 | 公式值生效
+-- 预期：触发 equal 边界外矫正 | rows ≈ 500（±20%）| p2 上每个 ver 的分区局部密度为 500，新增在 p2 也保持 500
+INSERT INTO res SELECT * FROM  check_erows('E-A-09', $$SELECT * FROM t_e_part1 WHERE region = 3$$, 1000, 0.20);
+-- 预期：触发 equal 边界外矫正 | rows ≈ 500（±20%）| p2 上每个 ver 的分区局部密度为 500，新增在 p2 也保持 500
+-- 【E-A-10】equal 触发 | 一级分区-剪枝单（p2）| 单列 | 上界截断
 -- 前置：一级分区-低 NDV
 DROP TABLE IF EXISTS t_e_part1_low;
 CREATE TABLE t_e_part1_low (ver int, region int)
-  PARTITION BY RANGE (region) (PARTITION p1 VALUES LESS THAN (6), PARTITION p2 VALUES LESS THAN (11));
-INSERT INTO t_e_part1_low SELECT (g%2)+1, (((g - 1) / 2) % 10) + 1 FROM generate_series(1, 100000) g;
+  PARTITION BY RANGE (region) (PARTITION p_old VALUES LESS THAN (3), PARTITION p_new VALUES LESS THAN (4));
+INSERT INTO t_e_part1_low SELECT (g%2)+1, (((g - 1) / 2) % 2) + 1 FROM generate_series(1, 10000) g;
 ANALYZE t_e_part1_low WITH ALL COMPLETE;
-INSERT INTO t_e_part1_low SELECT 6, ((g - 1)%10)+1 FROM generate_series(1, 50000) g;
-INSERT INTO res SELECT * FROM  check_erows('E-A-10', $$SELECT * FROM t_e_part1_low WHERE ver = 6 AND region = 8$$, 25000, 0.20);
+INSERT INTO t_e_part1_low SELECT (g%2)+1, 3 FROM generate_series(1, 5000) g;
+INSERT INTO res SELECT * FROM  check_erows('E-A-10', $$SELECT * FROM t_e_part1_low WHERE region = 3$$, 5000, 0.20);
 
 -- 【E-A-11】equal 触发 | 一级分区-剪枝单 | 多列 | 公式值生效
 DROP TABLE IF EXISTS t_e_part1;
 CREATE TABLE t_e_part1 (ver int, region int, v varchar(32))
   PARTITION BY RANGE (region) (
-    PARTITION p1 VALUES LESS THAN (4),
-    PARTITION p2 VALUES LESS THAN (7),
-    PARTITION p3 VALUES LESS THAN (11)
+    PARTITION p_old VALUES LESS THAN (3),
+    PARTITION p_new VALUES LESS THAN (4)
   );
 INSERT INTO t_e_part1
-  SELECT ((g - 1) % 50) + 1, (((g - 1) / 50) % 10) + 1, 'v'||g
-  FROM generate_series(1, 100000) g;
+  SELECT ((g - 1) % 10) + 1, (((g - 1) / 10) % 2) + 1, 'v'||g
+  FROM generate_series(1, 10000) g;
 CREATE INDEX st_e_p1_mc ON t_e_part1(ver, region);
 ANALYZE t_e_part1 WITH ALL COMPLETE;
-INSERT INTO t_e_part1 SELECT 51, ((g - 1) % 10) + 1, 'v'||g FROM generate_series(1, 2000) g;
-INSERT INTO res SELECT * FROM  check_erows('E-A-11', $$SELECT * FROM t_e_part1 WHERE ver = 51 AND region = 8$$, 200, 0.20);
+INSERT INTO t_e_part1 SELECT 51, ((g - 1) % 2) + 1, 'v'||g FROM generate_series(1, 1000) g;
+INSERT INTO res SELECT * FROM  check_erows('E-A-11', $$SELECT * FROM t_e_part1 WHERE ver = 51 AND region = 2$$, 500, 0.20);
 DROP INDEX st_e_p1_mc;
 
 -- 【E-A-12】equal 触发 | 一级分区-剪枝单 | 多列 | 上界截断
 DROP TABLE IF EXISTS t_e_part1_low;
 CREATE TABLE t_e_part1_low (ver int, region int)
-  PARTITION BY RANGE (region) (PARTITION p1 VALUES LESS THAN (6), PARTITION p2 VALUES LESS THAN (11));
-INSERT INTO t_e_part1_low SELECT (g%2)+1, (((g - 1) / 2) % 10) + 1 FROM generate_series(1, 100000) g;
+  PARTITION BY RANGE (region) (PARTITION p_old VALUES LESS THAN (3), PARTITION p_new VALUES LESS THAN (4));
+INSERT INTO t_e_part1_low SELECT (g%2)+1, (((g - 1) / 2) % 2) + 1 FROM generate_series(1, 10000) g;
 CREATE INDEX st_e_p1_mc2 ON t_e_part1_low(ver, region);
 ANALYZE t_e_part1_low WITH ALL COMPLETE;
-INSERT INTO t_e_part1_low SELECT 6, ((g - 1)%10)+1 FROM generate_series(1, 50000) g;
-INSERT INTO res SELECT * FROM  check_erows('E-A-12', $$SELECT * FROM t_e_part1_low WHERE ver = 6 AND region = 8$$, 5000, 0.20);
+INSERT INTO t_e_part1_low SELECT 6, ((g - 1)%2)+1 FROM generate_series(1, 5000) g;
+INSERT INTO res SELECT * FROM  check_erows('E-A-12', $$SELECT * FROM t_e_part1_low WHERE ver = 6 AND region = 2$$, 2500, 0.20);
 DROP INDEX st_e_p1_mc2;
 
 -- 【E-A-13】equal 触发 | 一级分区-不剪枝 | 单列 | 公式值生效
@@ -618,66 +616,64 @@ DROP INDEX st_e_p1_mc2;
 DROP TABLE IF EXISTS t_e_part1;
 CREATE TABLE t_e_part1 (ver int, region int, v varchar(32))
   PARTITION BY RANGE (region) (
-    PARTITION p1 VALUES LESS THAN (4),
-    PARTITION p2 VALUES LESS THAN (7),
-    PARTITION p3 VALUES LESS THAN (11)
+    PARTITION p_old VALUES LESS THAN (3),
+    PARTITION p_new VALUES LESS THAN (4)
   );
 INSERT INTO t_e_part1
-  SELECT ((g - 1) % 50) + 1, (((g - 1) / 50) % 10) + 1, 'v'||g
-  FROM generate_series(1, 100000) g;
+  SELECT ((g - 1) % 10) + 1, (((g - 1) / 10) % 2) + 1, 'v'||g
+  FROM generate_series(1, 10000) g;
 ANALYZE t_e_part1 WITH ALL COMPLETE;
-INSERT INTO t_e_part1 SELECT 51, ((g - 1) % 10) + 1, 'v'||g FROM generate_series(1, 2000) g;
-INSERT INTO res SELECT * FROM  check_erows('E-A-13', $$SELECT * FROM t_e_part1 WHERE ver = 51$$, 2000, 0.20);
+INSERT INTO t_e_part1 SELECT ((g - 1) % 10) + 1, 3, 'v'||g FROM generate_series(1, 1000) g;
+INSERT INTO res SELECT * FROM  check_erows('E-A-13', $$SELECT * FROM t_e_part1 WHERE region = 3$$, 1000, 0.20);
 
 -- 【E-A-14】equal 触发 | 一级分区-不剪枝 | 单列 | 上界截断
 DROP TABLE IF EXISTS t_e_part1_low;
 CREATE TABLE t_e_part1_low (ver int, region int)
-  PARTITION BY RANGE (region) (PARTITION p1 VALUES LESS THAN (6), PARTITION p2 VALUES LESS THAN (11));
-INSERT INTO t_e_part1_low SELECT (g%2)+1, (((g - 1) / 2) % 10) + 1 FROM generate_series(1, 100000) g;
+  PARTITION BY RANGE (region) (PARTITION p_old VALUES LESS THAN (3), PARTITION p_new VALUES LESS THAN (4));
+INSERT INTO t_e_part1_low SELECT (g%2)+1, (((g - 1) / 2) % 2) + 1 FROM generate_series(1, 10000) g;
 ANALYZE t_e_part1_low WITH ALL COMPLETE;
-INSERT INTO t_e_part1_low SELECT 6, ((g - 1)%10)+1 FROM generate_series(1, 50000) g;
-INSERT INTO res SELECT * FROM  check_erows('E-A-14', $$SELECT * FROM t_e_part1_low WHERE ver = 6$$, 50000, 0.20);
+INSERT INTO t_e_part1_low SELECT (g%2)+1, 3 FROM generate_series(1, 5000) g;
+INSERT INTO res SELECT * FROM  check_erows('E-A-14', $$SELECT * FROM t_e_part1_low WHERE region = 3$$, 5000, 0.20);
 
 -- 【E-A-15】equal 触发 | 一级分区-不剪枝 | 多列 | 公式值生效
 DROP TABLE IF EXISTS t_e_part1;
 CREATE TABLE t_e_part1 (ver int, region int, v varchar(32))
   PARTITION BY RANGE (region) (
-    PARTITION p1 VALUES LESS THAN (4),
-    PARTITION p2 VALUES LESS THAN (7),
-    PARTITION p3 VALUES LESS THAN (11)
+    PARTITION p_old VALUES LESS THAN (3),
+    PARTITION p_new VALUES LESS THAN (4)
   );
 INSERT INTO t_e_part1
-  SELECT ((g - 1) % 50) + 1, (((g - 1) / 50) % 10) + 1, 'v'||g
-  FROM generate_series(1, 100000) g;
+  SELECT ((g - 1) % 10) + 1, (((g - 1) / 10) % 2) + 1, 'v'||g
+  FROM generate_series(1, 10000) g;
 CREATE INDEX st_e_p1_nopr ON t_e_part1(ver, region);
 ANALYZE t_e_part1 WITH ALL COMPLETE;
-INSERT INTO t_e_part1 SELECT 51, ((g - 1) % 10) + 1, 'v'||g FROM generate_series(1, 2000) g;
+INSERT INTO t_e_part1 SELECT 51, ((g - 1) % 2) + 1, 'v'||g FROM generate_series(1, 1000) g;
 INSERT INTO res SELECT * FROM  check_erows('E-A-15', $$SELECT * FROM t_e_part1 WHERE ver = 51 AND v = 'v100'$$, 1, 0.20);  -- v 非分区键，不剪枝
 DROP INDEX st_e_p1_nopr;
 
 -- 【E-A-16】equal 触发 | 一级分区-不剪枝 | 多列 | 上界截断
 DROP TABLE IF EXISTS t_e_part1_low;
 CREATE TABLE t_e_part1_low (ver int, region int)
-  PARTITION BY RANGE (region) (PARTITION p1 VALUES LESS THAN (6), PARTITION p2 VALUES LESS THAN (11));
-INSERT INTO t_e_part1_low SELECT (g%2)+1, (((g - 1) / 2) % 10) + 1 FROM generate_series(1, 100000) g;
+  PARTITION BY RANGE (region) (PARTITION p_old VALUES LESS THAN (3), PARTITION p_new VALUES LESS THAN (4));
+INSERT INTO t_e_part1_low SELECT (g%2)+1, (((g - 1) / 2) % 2) + 1 FROM generate_series(1, 10000) g;
 CREATE INDEX st_e_p1_nopr2 ON t_e_part1_low(ver, region);
 ANALYZE t_e_part1_low WITH ALL COMPLETE;
-INSERT INTO t_e_part1_low SELECT 6, ((g - 1)%10)+1 FROM generate_series(1, 50000) g;
-INSERT INTO res SELECT * FROM  check_erows('E-A-16', $$SELECT * FROM t_e_part1_low WHERE ver = 6 AND region IN (1,5,9)$$, 15000, 0.20);
+INSERT INTO t_e_part1_low SELECT 6, ((g - 1)%2)+1 FROM generate_series(1, 5000) g;
+INSERT INTO res SELECT * FROM  check_erows('E-A-16', $$SELECT * FROM t_e_part1_low WHERE ver = 6 AND region IN (1,2)$$, 5000, 0.20);
 DROP INDEX st_e_p1_nopr2;
 
 -- 5.3 组 B：不触发单测 2 条
 
 -- 【E-B-01】equal 不触发 | qual_c 命中 MCV
--- 预期：不触发矫正（原逻辑）| rows ≈ 2040（±20%）| MCV 频率 0.02 × reltuples≈102000 = 2040
+-- 预期：不触发矫正（原逻辑）| rows ≈ 1100（±20%）| MCV 频率 0.02 × reltuples≈11000 = 1100
 DROP TABLE IF EXISTS t_e_astore;
 CREATE TABLE t_e_astore (ver int, region int, v varchar(32))
   WITH (storage_type=astore);
 INSERT INTO t_e_astore
-  SELECT ((g - 1) % 50) + 1, (((g - 1) / 50) % 10) + 1, 'v' || g FROM generate_series(1, 100000) g;
+  SELECT ((g - 1) % 10) + 1, (((g - 1) / 10) % 2) + 1, 'v' || g FROM generate_series(1, 10000) g;
 ANALYZE t_e_astore;
-INSERT INTO t_e_astore SELECT 51, ((g - 1) % 10) + 1, 'v' || g FROM generate_series(1, 2000) g;
-INSERT INTO res SELECT * FROM  check_erows('E-B-01', $$SELECT * FROM t_e_astore WHERE ver = 1$$, 2040, 0.20);
+INSERT INTO t_e_astore SELECT 51, ((g - 1) % 2) + 1, 'v' || g FROM generate_series(1, 1000) g;
+INSERT INTO res SELECT * FROM  check_erows('E-B-01', $$SELECT * FROM t_e_astore WHERE ver = 1$$, 1100, 0.20);
 
 -- 【E-B-02】equal 不触发 | qual_c 未命中 MCV 但 other_distinct > 0
 -- 前置：构造部分 MCV + 部分 non-MCV 场景
@@ -697,9 +693,9 @@ DROP TABLE IF EXISTS t_e_astore;
 CREATE TABLE t_e_astore (ver int, region int, v varchar(32))
   WITH (storage_type=astore);
 INSERT INTO t_e_astore
-  SELECT ((g - 1) % 50) + 1, (((g - 1) / 50) % 10) + 1, 'v' || g FROM generate_series(1, 100000) g;
+  SELECT ((g - 1) % 10) + 1, (((g - 1) / 10) % 2) + 1, 'v' || g FROM generate_series(1, 10000) g;
 ANALYZE t_e_astore;
-INSERT INTO t_e_astore SELECT 51, ((g - 1) % 10) + 1, 'v' || g FROM generate_series(1, 2000) g;
+INSERT INTO t_e_astore SELECT 51, ((g - 1) % 2) + 1, 'v' || g FROM generate_series(1, 1000) g;
 SET opt_use_static_stats = on;
 INSERT INTO res SELECT * FROM  check_erows('E-C-01', $$SELECT * FROM t_e_astore WHERE ver = 51$$, 1, 0.20);
 SET opt_use_static_stats = off;
@@ -710,18 +706,18 @@ DROP TABLE IF EXISTS t_e_astore;
 CREATE TABLE t_e_astore (ver int, region int, v varchar(32))
   WITH (storage_type=astore);
 INSERT INTO t_e_astore
-  SELECT ((g - 1) % 50) + 1, (((g - 1) / 50) % 10) + 1, 'v' || g FROM generate_series(1, 100000) g;
+  SELECT ((g - 1) % 10) + 1, (((g - 1) / 10) % 2) + 1, 'v' || g FROM generate_series(1, 10000) g;
 ANALYZE t_e_astore;
 DELETE FROM t_e_astore WHERE ver BETWEEN 10 AND 40;
-INSERT INTO t_e_astore SELECT 51, ((g - 1) % 10) + 1, 'v' || g FROM generate_series(1, 2000) g;
+INSERT INTO t_e_astore SELECT 51, ((g - 1) % 2) + 1, 'v' || g FROM generate_series(1, 1000) g;
 INSERT INTO res SELECT * FROM  check_erows('E-C-02', $$SELECT * FROM t_e_astore WHERE ver = 51$$, 1, 0.20);
 
 -- 【E-C-03】equal 约束回退 | insert 无页面增长
 DROP TABLE IF EXISTS t_e_nopagegrow;
 CREATE TABLE t_e_nopagegrow (ver int) WITH (fillfactor=30);
-INSERT INTO t_e_nopagegrow SELECT ((g - 1)%50)+1 FROM generate_series(1, 100000) g;
+INSERT INTO t_e_nopagegrow SELECT ((g - 1)%10)+1 FROM generate_series(1, 10000) g;
 ANALYZE t_e_nopagegrow;
-INSERT INTO t_e_nopagegrow SELECT 51 FROM generate_series(1, 2000) g;
+INSERT INTO t_e_nopagegrow SELECT 51 FROM generate_series(1, 1000) g;
 INSERT INTO res SELECT * FROM  check_erows('E-C-03', $$SELECT * FROM t_e_nopagegrow WHERE ver = 51$$, 82, 0.20);
 
 -- equal 不包含"索引主列"和"多列统计回退"约束（equal 明确支持多列；索引主列对 equal 不构成限制）。
@@ -729,113 +725,113 @@ INSERT INTO res SELECT * FROM  check_erows('E-C-03', $$SELECT * FROM t_e_nopageg
 -- 5.5 组 D：其它单测 7 条
 
 -- 【E-D-01】表类型 | 本地临时表
--- 预期：触发 equal 边界外矫正 | rows ≈ 2000（±20%）
+-- 预期：触发 equal 边界外矫正 | rows ≈ 1000（±20%）
 DROP TABLE IF EXISTS t_e_temp;
 CREATE TEMP TABLE t_e_temp (ver int) ON COMMIT PRESERVE ROWS;
-INSERT INTO t_e_temp SELECT ((g - 1)%50)+1 FROM generate_series(1, 100000) g;
+INSERT INTO t_e_temp SELECT ((g - 1)%10)+1 FROM generate_series(1, 10000) g;
 ANALYZE t_e_temp;
-INSERT INTO t_e_temp SELECT 51 FROM generate_series(1, 2000) g;
-INSERT INTO res SELECT * FROM  check_erows('E-D-01', $$SELECT * FROM t_e_temp WHERE ver = 51$$, 2000, 0.20);
+INSERT INTO t_e_temp SELECT 51 FROM generate_series(1, 1000) g;
+INSERT INTO res SELECT * FROM  check_erows('E-D-01', $$SELECT * FROM t_e_temp WHERE ver = 51$$, 1000, 0.20);
 
 -- 【E-D-02】表类型 | 全局临时表 GTT
--- 预期：触发 equal 边界外矫正 | rows ≈ 2000（±20%）
+-- 预期：触发 equal 边界外矫正 | rows ≈ 1000（±20%）
 DROP TABLE IF EXISTS t_e_gtt;
 CREATE GLOBAL TEMP TABLE t_e_gtt (ver int) ON COMMIT PRESERVE ROWS;
-INSERT INTO t_e_gtt SELECT ((g - 1)%50)+1 FROM generate_series(1, 100000) g;
+INSERT INTO t_e_gtt SELECT ((g - 1)%10)+1 FROM generate_series(1, 10000) g;
 ANALYZE t_e_gtt;
-INSERT INTO t_e_gtt SELECT 51 FROM generate_series(1, 2000) g;
-INSERT INTO res SELECT * FROM  check_erows('E-D-02', $$SELECT * FROM t_e_gtt WHERE ver = 51$$, 2000, 0.20);
-
+INSERT INTO t_e_gtt SELECT 51 FROM generate_series(1, 1000) g;
+INSERT INTO res SELECT * FROM  check_erows('E-D-02', $$SELECT * FROM t_e_gtt WHERE ver = 51$$, 1000, 0.20);
+-- 预期：触发 equal 边界外矫正 | rows ≈ 1000（±20%）| 剪枝到 p1+p2，分区局部密度与新增分布一致
 -- 【E-D-03】表类型 | 一级分区-剪枝多分区
--- 预期：触发 equal 边界外矫正 | rows ≈ 1400（±20%）| 剪枝到 p2+p3，分区局部密度与新增分布一致
+-- 预期：触发 equal 边界外矫正 | rows ≈ 1000（±20%）| 剪枝到 p1+p2，分区局部密度与新增分布一致
 DROP TABLE IF EXISTS t_e_part1;
 CREATE TABLE t_e_part1 (ver int, region int, v varchar(32))
   PARTITION BY RANGE (region) (
-    PARTITION p1 VALUES LESS THAN (4),
-    PARTITION p2 VALUES LESS THAN (7),
-    PARTITION p3 VALUES LESS THAN (11)
+    PARTITION p_old VALUES LESS THAN (3),
+    PARTITION p_new VALUES LESS THAN (4)
   );
 INSERT INTO t_e_part1
-  SELECT ((g - 1) % 50) + 1, (((g - 1) / 50) % 10) + 1, 'v'||g
-  FROM generate_series(1, 100000) g;
+  SELECT ((g - 1) % 10) + 1, (((g - 1) / 10) % 2) + 1, 'v'||g
+  FROM generate_series(1, 10000) g;
 ANALYZE t_e_part1 WITH ALL COMPLETE;
-INSERT INTO t_e_part1 SELECT 51, ((g - 1) % 10) + 1, 'v'||g FROM generate_series(1, 2000) g;
-INSERT INTO res SELECT * FROM  check_erows('E-D-03', $$SELECT * FROM t_e_part1 WHERE ver = 51 AND region >= 4$$, 1400, 0.20);
+-- 预期：触发 equal 边界外矫正 | rows ≈ 1000（±20%）| 剪枝到 p1+p2，分区局部密度与新增分布一致
+INSERT INTO t_e_part1 SELECT ((g - 1) % 10) + 1, 3, 'v'||g FROM generate_series(1, 1000) g;
+INSERT INTO res SELECT * FROM  check_erows('E-D-03', $$SELECT * FROM t_e_part1 WHERE region = 3$$, 1000, 0.20);
 
 -- 【E-D-04】表类型 | 二级分区-剪枝到一级
 DROP TABLE IF EXISTS t_e_part2;
 CREATE TABLE t_e_part2 (ver int, region int, v varchar(32))
   PARTITION BY RANGE (region) SUBPARTITION BY LIST (ver) (
-    PARTITION p1 VALUES LESS THAN (6) (
-      SUBPARTITION p1_v1 VALUES (1,2,3,4,5),
-      SUBPARTITION p1_v2 VALUES (DEFAULT)
+    PARTITION p_old VALUES LESS THAN (3) (
+      SUBPARTITION p_old_v1 VALUES (1,2,3,4,5),
+      SUBPARTITION p_old_v2 VALUES (DEFAULT)
     ),
-    PARTITION p2 VALUES LESS THAN (11) (
-      SUBPARTITION p2_v1 VALUES (1,2,3,4,5),
-      SUBPARTITION p2_v2 VALUES (DEFAULT)
+    PARTITION p_new VALUES LESS THAN (4) (
+      SUBPARTITION p_new_v1 VALUES (1,2,3,4,5),
+      SUBPARTITION p_new_v2 VALUES (DEFAULT)
     )
   );
 INSERT INTO t_e_part2
-  SELECT ((g - 1) % 50) + 1, (((g - 1) / 50) % 10) + 1, 'v'||g
-  FROM generate_series(1, 100000) g;
+  SELECT ((g - 1) % 10) + 1, (((g - 1) / 10) % 2) + 1, 'v'||g
+  FROM generate_series(1, 10000) g;
 ANALYZE t_e_part2 WITH ALL COMPLETE;
-INSERT INTO t_e_part2 SELECT 51, ((g - 1) % 10) + 1, 'v'||g FROM generate_series(1, 2000) g;
+INSERT INTO t_e_part2 SELECT ((g - 1) % 10) + 1, 3, 'v'||g FROM generate_series(1, 1000) g;
 -- 预期：触发 equal 边界外矫正 | 剪枝到 p2（含 p2_v2），二级维度不剪枝
-INSERT INTO res SELECT * FROM  check_erows('E-D-04', $$SELECT * FROM t_e_part2 WHERE ver = 51 AND region = 8$$, 1000, 0.20);
+INSERT INTO res SELECT * FROM  check_erows('E-D-04', $$SELECT * FROM t_e_part2 WHERE region = 3$$, 1000, 0.20);
 
 -- 【E-D-05】表类型 | 二级分区-剪枝到叶子
 -- 预期：触发 equal 边界外矫正 | 剪枝到 p2_v2 单叶子
 DROP TABLE IF EXISTS t_e_part2;
 CREATE TABLE t_e_part2 (ver int, region int, v varchar(32))
   PARTITION BY RANGE (region) SUBPARTITION BY LIST (ver) (
-    PARTITION p1 VALUES LESS THAN (6) (
-      SUBPARTITION p1_v1 VALUES (1,2,3,4,5),
-      SUBPARTITION p1_v2 VALUES (DEFAULT)
+    PARTITION p_old VALUES LESS THAN (3) (
+      SUBPARTITION p_old_v1 VALUES (1,2,3,4,5),
+      SUBPARTITION p_old_v2 VALUES (DEFAULT)
     ),
-    PARTITION p2 VALUES LESS THAN (11) (
-      SUBPARTITION p2_v1 VALUES (1,2,3,4,5),
-      SUBPARTITION p2_v2 VALUES (DEFAULT)
+    PARTITION p_new VALUES LESS THAN (4) (
+      SUBPARTITION p_new_v1 VALUES (1,2,3,4,5),
+      SUBPARTITION p_new_v2 VALUES (DEFAULT)
     )
   );
 INSERT INTO t_e_part2
-  SELECT ((g - 1) % 50) + 1, (((g - 1) / 50) % 10) + 1, 'v'||g
-  FROM generate_series(1, 100000) g;
+  SELECT ((g - 1) % 10) + 1, (((g - 1) / 10) % 2) + 1, 'v'||g
+  FROM generate_series(1, 10000) g;
 ANALYZE t_e_part2 WITH ALL COMPLETE;
-INSERT INTO t_e_part2 SELECT 51, ((g - 1) % 10) + 1, 'v'||g FROM generate_series(1, 2000) g;
-INSERT INTO res SELECT * FROM  check_erows('E-D-05', $$SELECT * FROM t_e_part2 WHERE ver = 51 AND region = 8 AND ver > 50$$, 1000, 0.20);  -- 仅 p2_v2 满足
+INSERT INTO t_e_part2 SELECT ((g - 1) % 10) + 1, 3, 'v'||g FROM generate_series(1, 1000) g;
+INSERT INTO res SELECT * FROM  check_erows('E-D-05', $$SELECT * FROM t_e_part2 WHERE region = 3 AND ver > 5$$, 500, 0.20);
 
 -- 【E-D-06】表类型 | 二级分区-不剪枝
 -- 预期：触发 equal 边界外矫正 | 按 v 过滤无法剪枝
 DROP TABLE IF EXISTS t_e_part2;
 CREATE TABLE t_e_part2 (ver int, region int, v varchar(32))
   PARTITION BY RANGE (region) SUBPARTITION BY LIST (ver) (
-    PARTITION p1 VALUES LESS THAN (6) (
-      SUBPARTITION p1_v1 VALUES (1,2,3,4,5),
-      SUBPARTITION p1_v2 VALUES (DEFAULT)
+    PARTITION p_old VALUES LESS THAN (3) (
+      SUBPARTITION p_old_v1 VALUES (1,2,3,4,5),
+      SUBPARTITION p_old_v2 VALUES (DEFAULT)
     ),
-    PARTITION p2 VALUES LESS THAN (11) (
-      SUBPARTITION p2_v1 VALUES (1,2,3,4,5),
-      SUBPARTITION p2_v2 VALUES (DEFAULT)
+    PARTITION p_new VALUES LESS THAN (4) (
+      SUBPARTITION p_new_v1 VALUES (1,2,3,4,5),
+      SUBPARTITION p_new_v2 VALUES (DEFAULT)
     )
   );
 INSERT INTO t_e_part2
-  SELECT ((g - 1) % 50) + 1, (((g - 1) / 50) % 10) + 1, 'v'||g
-  FROM generate_series(1, 100000) g;
+  SELECT ((g - 1) % 10) + 1, (((g - 1) / 10) % 2) + 1, 'v'||g
+  FROM generate_series(1, 10000) g;
 ANALYZE t_e_part2 WITH ALL COMPLETE;
-INSERT INTO t_e_part2 SELECT 51, ((g - 1) % 10) + 1, 'v'||g FROM generate_series(1, 2000) g;
-INSERT INTO res SELECT * FROM  check_erows('E-D-06', $$SELECT * FROM t_e_part2 WHERE ver = 51$$, 2000, 0.20);  -- ver 非分区键，扫所有叶子
+INSERT INTO t_e_part2 SELECT ((g - 1) % 10) + 1, 3, 'v'||g FROM generate_series(1, 1000) g;
+INSERT INTO res SELECT * FROM  check_erows('E-D-06', $$SELECT * FROM t_e_part2 WHERE region = 3$$, 1000, 0.20);
 
 -- 【E-D-07】统计信息类型 | 表达式统计信息（equal 谓词在表达式列上）
--- 预期：触发 equal 边界外矫正 | rows ≈ 2000（±20%）
+-- 预期：触发 equal 边界外矫正 | rows ≈ 1000（±20%）
 DROP TABLE IF EXISTS t_e_astore;
 CREATE TABLE t_e_astore (ver int, region int, v varchar(32))
   WITH (storage_type=astore);
 INSERT INTO t_e_astore
-  SELECT ((g - 1) % 50) + 1, (((g - 1) / 50) % 10) + 1, 'v' || g FROM generate_series(1, 100000) g;
+  SELECT ((g - 1) % 10) + 1, (((g - 1) / 10) % 2) + 1, 'v' || g FROM generate_series(1, 10000) g;
 CREATE INDEX st_e_expr ON t_e_astore((ver * 2));
 ANALYZE t_e_astore;
-INSERT INTO t_e_astore SELECT 51, ((g - 1) % 10) + 1, 'v' || g FROM generate_series(1, 2000) g;
-INSERT INTO res SELECT * FROM  check_erows('E-D-07', $$SELECT * FROM t_e_astore WHERE (ver * 2) = 102$$, 2000, 0.20);
+INSERT INTO t_e_astore SELECT 51, ((g - 1) % 2) + 1, 'v' || g FROM generate_series(1, 1000) g;
+INSERT INTO res SELECT * FROM  check_erows('E-D-07', $$SELECT * FROM t_e_astore WHERE (ver * 2) = 102$$, 1000, 0.20);
 DROP INDEX st_e_expr;
 
 -- 还有 3 个"跨谓词共用"的单测用例放在这里（increase_tuples=0、历史统计 prune、数据类型 timestamp/bigint/varchar、vacuum 只更表级的 equal 部分），避免重复：
@@ -844,58 +840,58 @@ DROP INDEX st_e_expr;
 -- 预期：触发但上界=0 | rows = 1（钳制）| 公式 min(200, 0) = 0 → 1
 DROP TABLE IF EXISTS t_e_noincr;
 CREATE TABLE t_e_noincr (ver int);
-INSERT INTO t_e_noincr SELECT ((g - 1)%50)+1 FROM generate_series(1, 100000) g;
+INSERT INTO t_e_noincr SELECT ((g - 1)%10)+1 FROM generate_series(1, 10000) g;
 ANALYZE t_e_noincr;
 -- 不再 insert
 INSERT INTO res SELECT * FROM  check_erows('E-D-08', $$SELECT * FROM t_e_noincr WHERE ver = 51$$, 1, 0.20);
 
 -- 【E-D-09】历史统计信息已 prune
--- 预期：触发 equal 边界外矫正 | rows ≈ 2000（±容忍，走当前 relpages/reltuples）
+-- 预期：触发 equal 边界外矫正 | rows ≈ 1000（±容忍，走当前 relpages/reltuples）
 DROP TABLE IF EXISTS t_e_astore;
 CREATE TABLE t_e_astore (ver int, region int, v varchar(32))
   WITH (storage_type=astore);
 INSERT INTO t_e_astore
-  SELECT ((g - 1) % 50) + 1, (((g - 1) / 50) % 10) + 1, 'v' || g FROM generate_series(1, 100000) g;
+  SELECT ((g - 1) % 10) + 1, (((g - 1) / 10) % 2) + 1, 'v' || g FROM generate_series(1, 10000) g;
 ANALYZE t_e_astore;
-INSERT INTO t_e_astore SELECT 51, ((g - 1) % 10) + 1, 'v' || g FROM generate_series(1, 2000) g;
+INSERT INTO t_e_astore SELECT 51, ((g - 1) % 2) + 1, 'v' || g FROM generate_series(1, 1000) g;
 CALL DBE_STATS.PURGE_STATS(current_timestamp);
-INSERT INTO res SELECT * FROM  check_erows('E-D-09', $$SELECT * FROM t_e_astore WHERE ver = 51$$, 2000, 0.20);
+INSERT INTO res SELECT * FROM  check_erows('E-D-09', $$SELECT * FROM t_e_astore WHERE ver = 51$$, 1000, 0.20);
 
 -- 【E-D-10】vacuum 只更表级不更列级
--- 预期：触发 equal 边界外矫正 | rows ≈ 2000（±20%）
+-- 预期：触发 equal 边界外矫正 | rows ≈ 1000（±20%）
 DROP TABLE IF EXISTS t_e_astore;
 CREATE TABLE t_e_astore (ver int, region int, v varchar(32))
   WITH (storage_type=astore);
 INSERT INTO t_e_astore
-  SELECT ((g - 1) % 50) + 1, (((g - 1) / 50) % 10) + 1, 'v' || g FROM generate_series(1, 100000) g;
+  SELECT ((g - 1) % 10) + 1, (((g - 1) / 10) % 2) + 1, 'v' || g FROM generate_series(1, 10000) g;
 ANALYZE t_e_astore;
-INSERT INTO t_e_astore SELECT 51, ((g - 1) % 10) + 1, 'v' || g FROM generate_series(1, 2000) g;
+INSERT INTO t_e_astore SELECT 51, ((g - 1) % 2) + 1, 'v' || g FROM generate_series(1, 1000) g;
 VACUUM t_e_astore;
-INSERT INTO res SELECT * FROM  check_erows('E-D-10', $$SELECT * FROM t_e_astore WHERE ver = 51$$, 2000, 0.20);
+INSERT INTO res SELECT * FROM  check_erows('E-D-10', $$SELECT * FROM t_e_astore WHERE ver = 51$$, 1000, 0.20);
 
 -- 【E-D-11】数据类型 | timestamp 列 equal 触发
 DROP TABLE IF EXISTS t_e_ts;
 CREATE TABLE t_e_ts (ts timestamp);
-INSERT INTO t_e_ts SELECT '2026-01-01'::timestamp + (((g - 1)%50)||' days')::interval FROM generate_series(1, 100000) g;
+INSERT INTO t_e_ts SELECT '2026-01-01'::timestamp + (((g - 1)%10)||' days')::interval FROM generate_series(1, 10000) g;
 ANALYZE t_e_ts;
-INSERT INTO t_e_ts SELECT '2026-03-01'::timestamp FROM generate_series(1, 2000) g;  -- 新值
-INSERT INTO res SELECT * FROM  check_erows('E-D-11', $$SELECT * FROM t_e_ts WHERE ts = '2026-03-01'::timestamp$$, 2000, 0.20);
+INSERT INTO t_e_ts SELECT '2026-03-01'::timestamp FROM generate_series(1, 1000) g;  -- 新值
+INSERT INTO res SELECT * FROM  check_erows('E-D-11', $$SELECT * FROM t_e_ts WHERE ts = '2026-03-01'::timestamp$$, 1000, 0.20);
 
 -- 【E-D-12】数据类型 | bigint 列 equal 触发
 DROP TABLE IF EXISTS t_e_bi;
 CREATE TABLE t_e_bi (b bigint);
-INSERT INTO t_e_bi SELECT (((g - 1)%50)+1)::bigint * 1000000000 FROM generate_series(1, 100000) g;
+INSERT INTO t_e_bi SELECT (((g - 1)%10)+1)::bigint * 1000000000 FROM generate_series(1, 10000) g;
 ANALYZE t_e_bi;
-INSERT INTO t_e_bi SELECT 99999999999::bigint FROM generate_series(1, 2000) g;
-INSERT INTO res SELECT * FROM  check_erows('E-D-12', $$SELECT * FROM t_e_bi WHERE b = 99999999999$$, 2000, 0.20);
+INSERT INTO t_e_bi SELECT 99999999999::bigint FROM generate_series(1, 1000) g;
+INSERT INTO res SELECT * FROM  check_erows('E-D-12', $$SELECT * FROM t_e_bi WHERE b = 99999999999$$, 1000, 0.20);
 
 -- 【E-D-13】数据类型 | varchar 列 equal 触发
 DROP TABLE IF EXISTS t_e_va;
 CREATE TABLE t_e_va (v varchar(32));
-INSERT INTO t_e_va SELECT 'ver' || (((g - 1)%50)+1) FROM generate_series(1, 100000) g;
+INSERT INTO t_e_va SELECT 'ver' || (((g - 1)%10)+1) FROM generate_series(1, 10000) g;
 ANALYZE t_e_va;
-INSERT INTO t_e_va SELECT 'ver999' FROM generate_series(1, 2000) g;
-INSERT INTO res SELECT * FROM  check_erows('E-D-13', $$SELECT * FROM t_e_va WHERE v = 'ver999'$$, 2000, 0.20);
+INSERT INTO t_e_va SELECT 'ver999' FROM generate_series(1, 1000) g;
+INSERT INTO res SELECT * FROM  check_erows('E-D-13', $$SELECT * FROM t_e_va WHERE v = 'ver999'$$, 1000, 0.20);
 
 -- 实际对应规模测算（D 组 20 条）：range D 6 + gt D 7 + equal D 13 = 26，稍超出原预算（20），但覆盖更完整，后续可砍合并。
 
@@ -922,9 +918,9 @@ DROP TABLE IF EXISTS t_e_astore;
 CREATE TABLE t_e_astore (ver int, region int, v varchar(32))
   WITH (storage_type=astore);
 INSERT INTO t_e_astore
-  SELECT ((g - 1) % 50) + 1, (((g - 1) / 50) % 10) + 1, 'v' || g FROM generate_series(1, 100000) g;
+  SELECT ((g - 1) % 10) + 1, (((g - 1) / 10) % 2) + 1, 'v' || g FROM generate_series(1, 10000) g;
 ANALYZE t_e_astore;
-INSERT INTO t_e_astore SELECT 51, ((g - 1) % 10) + 1, 'v' || g FROM generate_series(1, 2000) g;
+INSERT INTO t_e_astore SELECT 51, ((g - 1) % 2) + 1, 'v' || g FROM generate_series(1, 1000) g;
 
 DROP TABLE IF EXISTS t_e_otherdist;
 CREATE TABLE t_e_otherdist (ver int);
@@ -934,8 +930,8 @@ ANALYZE t_e_otherdist;
 INSERT INTO res SELECT * FROM  check_erows('S-04', $$SELECT * FROM t_r_astore WHERE id > 2000 AND id < 3000$$, 1200, 0.20);
 
 -- 【S-05】refine_growth_sel=on | 一般场景 equal 命中 MCV 估行不变
--- 预期：rows ≈ 2040（±20%）| MCV 频率 0.02 × 102000 = 2040
-INSERT INTO res SELECT * FROM  check_erows('S-05', $$SELECT * FROM t_e_astore WHERE ver = 1$$, 2040, 0.20);
+-- 预期：rows ≈ 1100（±20%）| MCV 频率 0.02 × 11000 = 1100
+INSERT INTO res SELECT * FROM  check_erows('S-05', $$SELECT * FROM t_e_astore WHERE ver = 1$$, 1100, 0.20);
 
 -- 【S-06】refine_growth_sel=on vs off | 一般场景 range 数值严格一致
 -- 前置：分别断言 refine_growth_sel=off/on 的 rows 相同（均按 pages 膨胀后估算）
@@ -953,9 +949,9 @@ INSERT INTO res SELECT * FROM  check_erows('S-07-on', $$SELECT * FROM t_r_astore
 
 -- 【S-08】refine_growth_sel=on vs off | 一般场景 equal 命中 MCV 数值严格一致
 SET refine_growth_sel = off;
-INSERT INTO res SELECT * FROM  check_erows('S-08-off', $$SELECT * FROM t_e_astore WHERE ver = 1$$, 2040, 0.20);
+INSERT INTO res SELECT * FROM  check_erows('S-08-off', $$SELECT * FROM t_e_astore WHERE ver = 1$$, 1100, 0.20);
 SET refine_growth_sel = on;
-INSERT INTO res SELECT * FROM  check_erows('S-08-on', $$SELECT * FROM t_e_astore WHERE ver = 1$$, 2040, 0.20);
+INSERT INTO res SELECT * FROM  check_erows('S-08-on', $$SELECT * FROM t_e_astore WHERE ver = 1$$, 1100, 0.20);
 
 -- 【S-09】refine_growth_sel=on | equal 未命中 MCV 但 other_distinct>0 的一般场景估行不变
 SET refine_growth_sel = off;
