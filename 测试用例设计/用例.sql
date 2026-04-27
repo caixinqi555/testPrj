@@ -1,9 +1,8 @@
 
-## 3. Range 谓词用例组
+-- 3. Range 谓词用例组
 
-### 3.1 组 Fixture
+-- 3.1 组 Fixture
 
-```sql
 -- R-Fixture-01：astore 普通表
 DROP TABLE IF EXISTS t_r_astore;
 CREATE TABLE t_r_astore (id int, ts timestamp, big bigint, v varchar(32));
@@ -52,13 +51,11 @@ INSERT INTO t_r_part1 SELECT g, '2026-01-01'::timestamp+(g||' seconds')::interva
 ANALYZE t_r_part1 WITH ALL COMPLETE;
 INSERT INTO t_r_part1 SELECT g, '2026-01-01'::timestamp+(g||' seconds')::interval,
   g::bigint*1000, 'v'||g FROM generate_series(10001, 12000) g;  -- 落入 p11、p12
-```
 
-> 基础 fixture 下：density = 10000 / (10000-1) ≈ 1.0，increase_tuples ≈ 2000。
+-- 基础 fixture 下：density = 10000 / (10000-1) ≈ 1.0，increase_tuples ≈ 2000。
 
-### 3.2 组 A：基础笛卡尔（触发路径）8 条
+-- 3.2 组 A：基础笛卡尔（触发路径）8 条
 
-```sql
 -- 【R-A-01】range 触发 | astore | 单列 | 公式值生效 | int
 -- 预期：触发 range 边界外矫正 | rows ≈ 100（±5%）| 公式 min(100*1.0=100, increase_tuples≈2000) = 100
 CALL check_erows('R-A-01', $$SELECT * FROM t_r_astore WHERE id > 11000 AND id < 11100$$, 100, 0.20);
@@ -95,11 +92,9 @@ CALL check_erows('R-A-07', $$SELECT * FROM t_r_part1 WHERE ts > '2026-01-02 00:0
 -- 【R-A-08】range 触发 | 一级分区-不剪枝 | 单列 | 上界截断 | int
 -- 预期：触发 range 边界外矫正 | rows ≈ 2000（±5%）| 公式值远大于 increase_tuples，上界截断
 CALL check_erows('R-A-08', $$SELECT * FROM t_r_part1 WHERE ts > '2026-01-02 00:00:00' AND ts < '2026-01-10 00:00:00'$$, 2000, 0.20);
-```
 
-### 3.3 组 B：不触发单测 2 条
+-- 3.3 组 B：不触发单测 2 条
 
-```sql
 -- 【R-B-01】range 不触发 | 谓词范围部分重合（本特性明确收束此场景）
 -- 预期：不触发矫正（原逻辑）| rows ≈ 1200（±20%）| 选择率 0.1 × pages 膨胀后 reltuples≈12000 = 1200
 CALL check_erows('R-B-01', $$SELECT * FROM t_r_astore WHERE id > 9000 AND id < 11000$$, 1200, 0.20);
@@ -107,11 +102,9 @@ CALL check_erows('R-B-01', $$SELECT * FROM t_r_astore WHERE id > 9000 AND id < 1
 -- 【R-B-02】range 不触发 | 谓词范围完全包含在统计信息范围内
 -- 预期：不触发矫正（原逻辑）| rows ≈ 240（±20%）| 选择率 0.02 × 12000 = 240
 CALL check_erows('R-B-02', $$SELECT * FROM t_r_astore WHERE id > 5000 AND id < 5200$$, 240, 0.20);
-```
 
-### 3.4 组 C：约束回退 5 条
+-- 3.4 组 C：约束回退 5 条
 
-```sql
 -- 【R-C-01】range 约束回退 | 谓词列为索引主列
 -- 预期：不触发矫正（约束回退到原逻辑）| rows ≈ 1（直方图边界被索引修正为实时值，原逻辑已给合理估值）
 CREATE INDEX ix_r_astore_id ON t_r_astore (id);
@@ -150,11 +143,9 @@ INSERT INTO t_r_nopagegrow SELECT g FROM generate_series(1, 10000) g;
 ANALYZE t_r_nopagegrow;
 INSERT INTO t_r_nopagegrow SELECT g FROM generate_series(10001, 10050) g;  -- 仅 50 行填入预留空间
 CALL check_erows('R-C-05', $$SELECT * FROM t_r_nopagegrow WHERE id > 11000 AND id < 11100$$, 1, 0.20);
-```
 
-### 3.5 组 D：其它单测 6 条
+-- 3.5 组 D：其它单测 6 条
 
-```sql
 -- 【R-D-01】表类型单测 | 本地临时表
 -- 预期：触发 range 边界外矫正 | rows ≈ 100（±5%）| 本地临时表统计信息走会话级 pg_class
 CREATE TEMP TABLE t_r_temp (id int, v varchar(32)) ON COMMIT PRESERVE ROWS;
@@ -218,17 +209,15 @@ INSERT INTO t_r_astore SELECT g, '2026-01-01'::timestamp+(g||' seconds')::interv
   g::bigint*1000, 'v'||g FROM generate_series(10001, 12000) g;
 VACUUM t_r_astore;   -- 更新 pg_class.relpages/reltuples，不更新 pg_statistic 列级统计
 CALL check_erows('R-D-06', $$SELECT * FROM t_r_astore WHERE id > 11000 AND id < 11100$$, 100, 0.20);
-```
 
----
+-- ---
 
-## 4. Gt 谓词用例组
+-- 4. Gt 谓词用例组
 
-### 4.1 组 Fixture
+-- 4.1 组 Fixture
 
-与 Range 组相同的 `t_r_astore / t_r_ustore / t_r_part1` 可复用，记作 `t_g_*` 别名使用。若需要独立 fixture，建表语句与 3.1 完全对称。下文复用 `t_r_astore` 等表名。
+-- 与 Range 组相同的 `t_r_astore / t_r_ustore / t_r_part1` 可复用，记作 `t_g_*` 别名使用。若需要独立 fixture，建表语句与 3.1 完全对称。下文复用 `t_r_astore` 等表名。
 
-```sql
 -- G 组复用 t_r_astore 前先恢复标准基线，避免 Range 组中 DELETE/ANALYZE/VACUUM 用例污染增量。
 DROP TABLE IF EXISTS t_r_astore;
 CREATE TABLE t_r_astore (id int, ts timestamp, big bigint, v varchar(32));
@@ -241,15 +230,13 @@ INSERT INTO t_r_astore
   SELECT g, '2026-01-01'::timestamp + (g || ' seconds')::interval,
          g::bigint * 1000, 'v' || g
   FROM generate_series(10001, 12000) g;
-```
 
-> gt 谓词的外推公式：`qual_h = stats_max + (stats_max - stats_min) × (increase_tuples / analyzed_tuples)`
-> 在基础 fixture 下：qual_h ≈ 10000 + 9999 × (2000/10000) ≈ 12000
-> 外推后 out_of_bounds_width = 12000 - qual_l
+-- gt 谓词的外推公式：`qual_h = stats_max + (stats_max - stats_min) × (increase_tuples / analyzed_tuples)`
+-- 在基础 fixture 下：qual_h ≈ 10000 + 9999 × (2000/10000) ≈ 12000
+-- 外推后 out_of_bounds_width = 12000 - qual_l
 
-### 4.2 组 A：基础笛卡尔 8 条
+-- 4.2 组 A：基础笛卡尔 8 条
 
-```sql
 -- 【G-A-01】gt 触发 | astore | 单列 | 公式值生效 | int
 -- 预期：触发 gt 边界外矫正 | rows ≈ 400（±5%）| qual_l=11600，外推 qual_h≈12000，宽度=400，公式 min(400, 2000)=400
 CALL check_erows('G-A-01', $$SELECT * FROM t_r_astore WHERE id > 11600$$, 400, 0.20);
@@ -281,11 +268,9 @@ CALL check_erows('G-A-07', $$SELECT * FROM t_r_part1 WHERE ts > '2026-01-01 03:1
 -- 【G-A-08】gt 触发 | 一级分区-不剪枝 | 单列 | 上界截断 | int
 -- 预期：触发 gt 边界外矫正 | rows ≈ 2000（±5%）| qual_l 靠近边界，估行结果贴近上界
 CALL check_erows('G-A-08', $$SELECT * FROM t_r_part1 WHERE ts > '2026-01-01 02:46:41'$$, 2000, 0.20);
-```
 
-### 4.3 组 B：不触发单测 2 条
+-- 4.3 组 B：不触发单测 2 条
 
-```sql
 -- 【G-B-01】gt 不触发 | qual_l 在统计信息范围内（部分重合）
 -- 预期：不触发矫正（原逻辑）| rows ≈ 2400（±20%）| 选择率 0.2 × 12000（pages 膨胀后）= 2400
 CALL check_erows('G-B-01', $$SELECT * FROM t_r_astore WHERE id > 8000$$, 2400, 0.20);
@@ -293,11 +278,9 @@ CALL check_erows('G-B-01', $$SELECT * FROM t_r_astore WHERE id > 8000$$, 2400, 0
 -- 【G-B-02】gt 不触发 | qual_l 在统计信息范围内（恰好等于 stats_max）
 -- 预期：不触发矫正（原逻辑）| rows 按直方图估算 | qual_l=10000 恰等 stats_max，不严格大于
 CALL check_erows('G-B-02', $$SELECT * FROM t_r_astore WHERE id > 10000$$, 1, 0.20);
-```
 
-### 4.4 组 C：约束回退 5 条
+-- 4.4 组 C：约束回退 5 条
 
-```sql
 -- 【G-C-01】gt 约束回退 | 谓词列为索引主列
 -- 预期：不触发矫正（约束回退）| 走原逻辑（直方图边界被索引修正为实时值）
 CREATE INDEX ix_g_astore_id ON t_r_astore (id);
@@ -336,11 +319,9 @@ INSERT INTO t_g_nopagegrow SELECT g FROM generate_series(1, 10000) g;
 ANALYZE t_g_nopagegrow;
 INSERT INTO t_g_nopagegrow SELECT g FROM generate_series(10001, 10050) g;
 CALL check_erows('G-C-05', $$SELECT * FROM t_g_nopagegrow WHERE id > 10100$$, 1, 0.20);
-```
 
-### 4.5 组 D：其它单测 7 条
+-- 4.5 组 D：其它单测 7 条
 
-```sql
 -- 【G-D-01】表类型 | 本地临时表
 -- 预期：触发 gt 边界外矫正 | rows ≈ 400（±5%）
 CREATE TEMP TABLE t_g_temp (id int, v varchar(32)) ON COMMIT PRESERVE ROWS;
@@ -404,15 +385,13 @@ INSERT INTO t_r_astore SELECT g, '2026-01-01'::timestamp+(g||' seconds')::interv
   g::bigint*1000, 'v'||g FROM generate_series(10001, 12000) g;
 CALL check_erows('G-D-07', $$SELECT * FROM t_r_astore WHERE (id * 2) > 20200$$, 1900, 0.20);
 DROP INDEX st_g_expr;
-```
 
----
+-- ---
 
-## 5. Equal 谓词用例组
+-- 5. Equal 谓词用例组
 
-### 5.1 组 Fixture
+-- 5.1 组 Fixture
 
-```sql
 -- E-Fixture-01：astore 普通表（低 NDV 列，全为 MCV 场景）
 DROP TABLE IF EXISTS t_e_astore;
 CREATE TABLE t_e_astore (ver int, region int, v varchar(32));
@@ -442,14 +421,12 @@ CREATE TABLE t_e_part1 (ver int, region int, v varchar(32))
 INSERT INTO t_e_part1 SELECT (g%50)+1, (g%10)+1, 'v'||g FROM generate_series(1, 10000) g;
 ANALYZE t_e_part1 WITH ALL COMPLETE;
 INSERT INTO t_e_part1 SELECT 51, (g%10)+1, 'v'||g FROM generate_series(1, 2000) g;
-```
 
-> equal 公式：`target_rows = Min(analyzed_tuples / n_distinct, increase_tuples)`
-> 基础 fixture 下：10000/50 = 200 → min(200, 2000) = 200（公式生效）；若 n_distinct 较小（如 2）则 10000/2=5000 > 2000 → 上界截断
+-- equal 公式：`target_rows = Min(analyzed_tuples / n_distinct, increase_tuples)`
+-- 基础 fixture 下：10000/50 = 200 → min(200, 2000) = 200（公式生效）；若 n_distinct 较小（如 2）则 10000/2=5000 > 2000 → 上界截断
 
-### 5.2 组 A：基础笛卡尔 16 条
+-- 5.2 组 A：基础笛卡尔 16 条
 
-```sql
 -- 【E-A-01】equal 触发 | astore | 单列 | 未命中+other=0 | 公式值生效 | int
 -- 预期：触发 equal 边界外矫正 | rows ≈ 200（±5%）| 公式 min(10000/50=200, 2000) = 200
 CALL check_erows('E-A-01', $$SELECT * FROM t_e_astore WHERE ver = 51$$, 200, 0.20);
@@ -551,11 +528,9 @@ CREATE STATISTICS st_e_p1_nopr2 ON ver, region FROM t_e_part1_low;
 ANALYZE t_e_part1_low WITH ALL COMPLETE;
 CALL check_erows('E-A-16', $$SELECT * FROM t_e_part1_low WHERE ver = 6 AND region IN (1,5,9)$$, 600, 0.20);
 DROP STATISTICS st_e_p1_nopr2;
-```
 
-### 5.3 组 B：不触发单测 2 条
+-- 5.3 组 B：不触发单测 2 条
 
-```sql
 -- 【E-B-01】equal 不触发 | qual_c 命中 MCV
 -- 预期：不触发矫正（原逻辑）| rows ≈ 240（±20%）| MCV 频率 0.02 × pages 膨胀后 reltuples≈12000 = 240
 CALL check_erows('E-B-01', $$SELECT * FROM t_e_astore WHERE ver = 1$$, 240, 0.20);
@@ -569,11 +544,9 @@ INSERT INTO t_e_otherdist SELECT (g%10)+1 FROM generate_series(1, 9000) g;
 INSERT INTO t_e_otherdist SELECT (g%100)+11 FROM generate_series(1, 1000) g;
 ANALYZE t_e_otherdist;
 CALL check_erows('E-B-02', $$SELECT * FROM t_e_otherdist WHERE ver = 50$$, 10, 0.20);  -- 未命中 MCV，但 other_distinct>0，走原逻辑
-```
 
-### 5.4 组 C：约束回退 3 条
+-- 5.4 组 C：约束回退 3 条
 
-```sql
 -- 【E-C-01】equal 约束回退 | opt_use_static_stats=on
 -- 预期：不触发矫正（整体不支持）| rows = 1（原逻辑）
 SET opt_use_static_stats = on;
@@ -597,13 +570,11 @@ INSERT INTO t_e_nopagegrow SELECT (g%50)+1 FROM generate_series(1, 10000) g;
 ANALYZE t_e_nopagegrow;
 INSERT INTO t_e_nopagegrow SELECT 51 FROM generate_series(1, 50) g;
 CALL check_erows('E-C-03', $$SELECT * FROM t_e_nopagegrow WHERE ver = 51$$, 1, 0.20);
-```
 
-> equal 不包含"索引主列"和"多列统计回退"约束（equal 明确支持多列；索引主列对 equal 不构成限制）。
+-- equal 不包含"索引主列"和"多列统计回退"约束（equal 明确支持多列；索引主列对 equal 不构成限制）。
 
-### 5.5 组 D：其它单测 7 条
+-- 5.5 组 D：其它单测 7 条
 
-```sql
 -- 【E-D-01】表类型 | 本地临时表
 -- 预期：触发 equal 边界外矫正 | rows ≈ 200（±5%）
 CREATE TEMP TABLE t_e_temp (ver int) ON COMMIT PRESERVE ROWS;
@@ -661,11 +632,9 @@ ANALYZE t_e_astore;
 INSERT INTO t_e_astore SELECT 51, (g % 10) + 1, 'v' || g FROM generate_series(1, 2000) g;
 CALL check_erows('E-D-07', $$SELECT * FROM t_e_astore WHERE (ver * 2) = 102$$, 200, 0.20);
 DROP INDEX st_e_expr;
-```
 
-> 还有 3 个"跨谓词共用"的单测用例放在这里（increase_tuples=0、历史统计 prune、数据类型 timestamp/bigint/varchar、vacuum 只更表级的 equal 部分），避免重复：
+-- 还有 3 个"跨谓词共用"的单测用例放在这里（increase_tuples=0、历史统计 prune、数据类型 timestamp/bigint/varchar、vacuum 只更表级的 equal 部分），避免重复：
 
-```sql
 -- 【E-D-08】increase_tuples = 0 边界
 -- 预期：触发但上界=0 | rows = 1（钳制）| 公式 min(200, 0) = 0 → 1
 CREATE TABLE t_e_noincr (ver int);
@@ -716,15 +685,13 @@ INSERT INTO t_e_va SELECT 'ver' || ((g%50)+1) FROM generate_series(1, 10000) g;
 ANALYZE t_e_va;
 INSERT INTO t_e_va SELECT 'ver999' FROM generate_series(1, 2000) g;
 CALL check_erows('E-D-13', $$SELECT * FROM t_e_va WHERE v = 'ver999'$$, 200, 0.20);
-```
 
-> 实际对应规模测算（D 组 20 条）：range D 6 + gt D 7 + equal D 13 = 26，稍超出原预算（20），但覆盖更完整，后续可砍合并。
+-- 实际对应规模测算（D 组 20 条）：range D 6 + gt D 7 + equal D 13 = 26，稍超出原预算（20），但覆盖更完整，后续可砍合并。
 
----
+-- ---
 
-## 6. 开关回归组
+-- 6. 开关回归组
 
-```sql
 -- 【S-01】refine_growth_sel=off | range 触发场景估行回退到 1
 -- 预期：rows = 1（新特性关闭，走原下界钳制）
 SET refine_growth_sel = off;
@@ -774,6 +741,5 @@ SET refine_growth_sel = off;
 CALL check_erows('S-09-off', $$SELECT * FROM t_e_otherdist WHERE ver = 50$$, 10, 0.20);
 SET refine_growth_sel = on;
 CALL check_erows('S-09-on', $$SELECT * FROM t_e_otherdist WHERE ver = 50$$, 10, 0.20);
-```
 
----
+-- ---
