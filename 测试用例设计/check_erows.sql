@@ -1,19 +1,21 @@
--- 估行断言存储过程：对任意 SELECT，EXPLAIN (FORMAT JSON) 抽顶层 Plan Rows，和预期比对
--- 推荐用法：CALL check_erows('<case_id>', '<sql>', <expected>, <tolerance>);
--- 兼容用法：CALL check_erows('<sql>', <expected>, <tolerance>);
--- 输出：一行 NOTICE，格式 [case_id] E_rows=A expected=B err=X% OK/FAIL
--- 注：本机 PG 未编译 libxml，使用 FORMAT JSON 替代 XML
-
-CREATE OR REPLACE PROCEDURE check_erows(
+DROP FUNCTION IF EXISTS check_erows;
+CREATE OR REPLACE FUNCTION check_erows(
     p_case_id   text,
     p_sql       text,
     p_expected  numeric,
     p_tol       numeric DEFAULT 0.05
-) LANGUAGE plpgsql AS
+) RETURNS TABLE (
+    case_id        text,
+    E_rows_old     numeric,
+    A_rows         numeric,
+    E_rows_feature numeric,
+    expected       numeric,
+    err_percent    numeric,
+    status         text
+)
+LANGUAGE plpgsql AS $$
+DECLARE
     plan_json jsonb;
-    E_rows_feature    numeric;
-    E_rows_old    numeric;
-    A_rows    numeric;
     v_err     numeric;
     v_status  text;
 BEGIN
@@ -32,12 +34,18 @@ BEGIN
         v_err := abs(E_rows_feature - p_expected) / p_expected;
     END IF;
 
-    IF (abs(E_rows_feature - p_expected) <= 2 AND p_expected <= 10) OR v_err <= p_tol THEN
+    IF (abs(E_rows_feature - p_expected) <= 2 AND p_expected <= 10)
+       OR v_err <= p_tol THEN
         v_status := 'OK';
     ELSE
         v_status := 'FAIL';
     END IF;
 
-    RAISE NOTICE '%', format('[%s] E_rows_old=%s A_rows=%s E_rows_feature=%s expected=%s err=%s%% %s',
-        p_case_id, E_rows_old, A_rows, E_rows_feature, p_expected, round(v_err * 100, 2), v_status);
+    case_id := p_case_id;
+    expected := p_expected;
+    err_percent := round(v_err * 100, 2);
+    status := v_status;
+
+    RETURN NEXT;
 END;
+$$;
