@@ -200,7 +200,7 @@ INSERT INTO t_r_astore SELECT g, '2026-01-01'::timestamp+(g||' seconds')::interv
 ANALYZE t_r_astore;
 INSERT INTO t_r_astore SELECT g, '2026-01-01'::timestamp+(g||' seconds')::interval,
   g::bigint*1000, 'v'||g FROM generate_series(10001, 12000) g;
-CALL "DBE_STATS".PURGE_STATS(current_timestamp);
+CALL DBE_STATS.PURGE_STATS(current_timestamp);
 INSERT INTO res SELECT * FROM  check_erows('R-D-05', $$SELECT * FROM t_r_astore WHERE id > 11000 AND id < 11100$$, 100, 0.20);
 
 -- 【R-D-06】vacuum 只更表级不更列级
@@ -674,7 +674,7 @@ INSERT INTO t_e_astore
   SELECT (g % 50) + 1, (g % 10) + 1, 'v' || g FROM generate_series(1, 10000) g;
 ANALYZE t_e_astore;
 INSERT INTO t_e_astore SELECT 51, (g % 10) + 1, 'v' || g FROM generate_series(1, 2000) g;
-CALL "DBE_STATS".PURGE_STATS(current_timestamp);
+CALL DBE_STATS.PURGE_STATS(current_timestamp);
 INSERT INTO res SELECT * FROM  check_erows('E-D-09', $$SELECT * FROM t_e_astore WHERE ver = 51$$, 200, 0.20);
 
 -- 【E-D-10】vacuum 只更表级不更列级
