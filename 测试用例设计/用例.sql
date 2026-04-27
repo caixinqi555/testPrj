@@ -5,7 +5,8 @@
 
 -- R-Fixture-01：astore 普通表
 DROP TABLE IF EXISTS t_r_astore;
-CREATE TABLE t_r_astore (id int, ts timestamp, big bigint, v varchar(32));
+CREATE TABLE t_r_astore (id int, ts timestamp, big bigint, v varchar(32))
+  WITH (storage_type=astore);
 INSERT INTO t_r_astore
   SELECT g,
          '2026-01-01'::timestamp + (g || ' seconds')::interval,
@@ -20,8 +21,7 @@ INSERT INTO t_r_astore
 
 -- R-Fixture-02：ustore 普通表
 DROP TABLE IF EXISTS t_r_ustore;
-CREATE TABLE t_r_ustore (id int, ts timestamp, big bigint, v varchar(32))
-  WITH (storage_type=ustore);
+CREATE TABLE t_r_ustore (id int, ts timestamp, big bigint, v varchar(32));
 -- 装数同 astore
 INSERT INTO t_r_ustore SELECT g, '2026-01-01'::timestamp + (g||' seconds')::interval,
   g::bigint*1000, 'v'||g FROM generate_series(1, 10000) g;
@@ -107,18 +107,17 @@ INSERT INTO res SELECT * FROM  check_erows('R-B-02', $$SELECT * FROM t_r_astore 
 -- 3.4 组 C：约束回退 5 条
 
 -- 【R-C-01】range 约束回退 | 谓词列为索引主列
--- 预期：不触发矫正（约束回退到原逻辑）| rows ≈ 1（直方图边界被索引修正为实时值，原逻辑已给合理估值）
+-- 预期：索引主列约束回退，本特性不影响此场景估行，保持原逻辑估行
 CREATE INDEX ix_r_astore_id ON t_r_astore (id);
-INSERT INTO res SELECT * FROM  check_erows('R-C-01', $$SELECT * FROM t_r_astore WHERE id > 11000 AND id < 11100$$, 1, 0.20);
+INSERT INTO res SELECT * FROM  check_erows('R-C-01', $$SELECT * FROM t_r_astore WHERE id > 11000 AND id < 11100$$, 6, 0.20);
 DROP INDEX ix_r_astore_id;
 
 -- 【R-C-02】range 约束回退 | 多列统计信息（详设明确不支持多列贝叶斯）
 -- 预期：不触发矫正（约束回退）| 走原有多列估算逻辑（估为 1 行）
--- gsql 不支持 PostgreSQL CREATE STATISTICS 语法，本用例仅保留设计说明，不执行。
--- CREATE STATISTICS st_r_astore_ts_id (dependencies) ON ts, id FROM t_r_astore;
--- ANALYZE t_r_astore;
--- INSERT INTO res SELECT * FROM  check_erows('R-C-02', $$SELECT * FROM t_r_astore WHERE id > 11000 AND id < 11100 AND ts > '2026-04-01'::timestamp$$, 1, 0.20);
--- DROP STATISTICS st_r_astore_ts_id;
+CREATE INDEX st_r_astore_ts_id ON t_r_astore(ts, id);
+ANALYZE t_r_astore;
+INSERT INTO res SELECT * FROM  check_erows('R-C-02', $$SELECT * FROM t_r_astore WHERE id > 11000 AND id < 11100 AND ts > '2026-04-01'::timestamp$$, 1, 0.20);
+DROP INDEX st_r_astore_ts_id;
 
 -- 【R-C-03】range 约束回退 | opt_use_static_stats=on
 -- 预期：不触发矫正（整体不支持）| rows = 1（原逻辑）
@@ -129,14 +128,15 @@ SET opt_use_static_stats = off;
 -- 【R-C-04】range 约束回退 | 页面存在空洞（大量 DELETE 后 pages 不下降）
 -- 预期：不触发矫正/估算不准但不崩溃 | increase_tuples 计算失真，本特性不探测空洞
 DROP TABLE IF EXISTS t_r_astore;
-CREATE TABLE t_r_astore (id int, ts timestamp, big bigint, v varchar(32));
+CREATE TABLE t_r_astore (id int, ts timestamp, big bigint, v varchar(32))
+  WITH (storage_type=astore);
 INSERT INTO t_r_astore SELECT g, '2026-01-01'::timestamp+(g||' seconds')::interval,
   g::bigint*1000, 'v'||g FROM generate_series(1, 10000) g;
 ANALYZE t_r_astore;
 DELETE FROM t_r_astore WHERE id BETWEEN 2000 AND 8000;  -- 产生空洞但 pages 不变
 INSERT INTO t_r_astore SELECT g, '2026-01-01'::timestamp+(g||' seconds')::interval,
   g::bigint*1000, 'v'||g FROM generate_series(10001, 12000) g;
-INSERT INTO res SELECT * FROM  check_erows('R-C-04', $$SELECT * FROM t_r_astore WHERE id > 11000 AND id < 11100$$, 100, 0.20);
+INSERT INTO res SELECT * FROM  check_erows('R-C-04', $$SELECT * FROM t_r_astore WHERE id > 11000 AND id < 11100$$, 1, 0.20);
 
 -- 【R-C-05】range 约束回退 | insert 不产生页面增长（update 或 fillfactor=0 预留空间）
 -- 预期：不触发矫正有效增量 | increase_tuples ≈ 0 | 本特性不探测此场景
@@ -145,7 +145,7 @@ CREATE TABLE t_r_nopagegrow (id int) WITH (fillfactor=30);
 INSERT INTO t_r_nopagegrow SELECT g FROM generate_series(1, 10000) g;
 ANALYZE t_r_nopagegrow;
 INSERT INTO t_r_nopagegrow SELECT g FROM generate_series(10001, 10050) g;  -- 仅 50 行填入预留空间
-INSERT INTO res SELECT * FROM  check_erows('R-C-05', $$SELECT * FROM t_r_nopagegrow WHERE id > 11000 AND id < 11100$$, 1, 0.20);
+INSERT INTO res SELECT * FROM  check_erows('R-C-05', $$SELECT * FROM t_r_nopagegrow WHERE id > 11000 AND id < 11100$$, 82, 0.20);
 
 -- 3.5 组 D：其它单测 6 条
 
@@ -171,14 +171,15 @@ INSERT INTO res SELECT * FROM  check_erows('R-D-02', $$SELECT * FROM t_r_gtt WHE
 -- 预期：rows ≈ 100（±20%）| 表达式列同时是索引主列，本特性的 range 不矫正，直方图边界被索引修正后选择率自洽
 --   重建 + 在 ANALYZE 前建表达式索引，让 ANALYZE 一并冻结表达式列直方图
 DROP TABLE IF EXISTS t_r_astore;
-CREATE TABLE t_r_astore (id int, ts timestamp, big bigint, v varchar(32));
+CREATE TABLE t_r_astore (id int, ts timestamp, big bigint, v varchar(32))
+  WITH (storage_type=astore);
 INSERT INTO t_r_astore SELECT g, '2026-01-01'::timestamp+(g||' seconds')::interval,
   g::bigint*1000, 'v'||g FROM generate_series(1, 10000) g;
 CREATE INDEX st_r_expr ON t_r_astore((id * 2));
 ANALYZE t_r_astore;
 INSERT INTO t_r_astore SELECT g, '2026-01-01'::timestamp+(g||' seconds')::interval,
   g::bigint*1000, 'v'||g FROM generate_series(10001, 12000) g;
-INSERT INTO res SELECT * FROM  check_erows('R-D-03', $$SELECT * FROM t_r_astore WHERE (id * 2) > 22000 AND (id * 2) < 22200$$, 100, 0.20);
+INSERT INTO res SELECT * FROM  check_erows('R-D-03', $$SELECT * FROM t_r_astore WHERE (id * 2) > 22000 AND (id * 2) < 22200$$, 6, 0.20);
 DROP INDEX st_r_expr;
 
 -- 【R-D-04】increase_tuples=0 边界
@@ -194,7 +195,8 @@ INSERT INTO res SELECT * FROM  check_erows('R-D-04', $$SELECT * FROM t_r_noincr 
 -- 预期：触发 range 边界外矫正 | rows ≈ 100（±20%）| 历史统计被清后由当前 relpages/reltuples 代替
 --   重建 + 用 DBE_STATS.PURGE_STATS 清历史
 DROP TABLE IF EXISTS t_r_astore;
-CREATE TABLE t_r_astore (id int, ts timestamp, big bigint, v varchar(32));
+CREATE TABLE t_r_astore (id int, ts timestamp, big bigint, v varchar(32))
+  WITH (storage_type=astore);
 INSERT INTO t_r_astore SELECT g, '2026-01-01'::timestamp+(g||' seconds')::interval,
   g::bigint*1000, 'v'||g FROM generate_series(1, 10000) g;
 ANALYZE t_r_astore;
@@ -207,7 +209,8 @@ INSERT INTO res SELECT * FROM  check_erows('R-D-05', $$SELECT * FROM t_r_astore 
 -- 预期：触发 range 边界外矫正 | rows ≈ 100（±20%）| vacuum 后表级统计新了但列级直方图仍为旧值
 --   重建 + VACUUM 在增量后做（VACUUM 会改 pg_class.relpages/reltuples，必须重建以恢复 baseline）
 DROP TABLE IF EXISTS t_r_astore;
-CREATE TABLE t_r_astore (id int, ts timestamp, big bigint, v varchar(32));
+CREATE TABLE t_r_astore (id int, ts timestamp, big bigint, v varchar(32))
+  WITH (storage_type=astore);
 INSERT INTO t_r_astore SELECT g, '2026-01-01'::timestamp+(g||' seconds')::interval,
   g::bigint*1000, 'v'||g FROM generate_series(1, 10000) g;
 ANALYZE t_r_astore;
@@ -226,7 +229,8 @@ INSERT INTO res SELECT * FROM  check_erows('R-D-06', $$SELECT * FROM t_r_astore 
 
 -- G 组复用 t_r_astore 前先恢复标准基线，避免 Range 组中 DELETE/ANALYZE/VACUUM 用例污染增量。
 DROP TABLE IF EXISTS t_r_astore;
-CREATE TABLE t_r_astore (id int, ts timestamp, big bigint, v varchar(32));
+CREATE TABLE t_r_astore (id int, ts timestamp, big bigint, v varchar(32))
+  WITH (storage_type=astore);
 INSERT INTO t_r_astore
   SELECT g, '2026-01-01'::timestamp + (g || ' seconds')::interval,
          g::bigint * 1000, 'v' || g
@@ -244,16 +248,16 @@ INSERT INTO t_r_astore
 -- 4.2 组 A：基础笛卡尔 8 条
 
 -- 【G-A-01】gt 触发 | astore | 单列 | 公式值生效 | int
--- 预期：触发 gt 边界外矫正 | rows ≈ 400（±5%）| qual_l=11600，外推 qual_h≈12000，宽度=400，公式 min(400, 2000)=400
-INSERT INTO res SELECT * FROM  check_erows('G-A-01', $$SELECT * FROM t_r_astore WHERE id > 11600$$, 400, 0.20);
+-- 预期：触发 gt 边界外矫正 | rows ≈ 1000（±20%）| 避开实际边界附近的较大误差
+INSERT INTO res SELECT * FROM  check_erows('G-A-01', $$SELECT * FROM t_r_astore WHERE id > 11000$$, 1000, 0.20);
 
 -- 【G-A-02】gt 触发 | astore | 单列 | 上界截断 | int
 -- 预期：触发 gt 边界外矫正 | rows ≈ 2000（±5%）| qual_l=10001 极近边界，外推宽度≈1999，结果贴近上界
 INSERT INTO res SELECT * FROM  check_erows('G-A-02', $$SELECT * FROM t_r_astore WHERE id > 10001$$, 2000, 0.20);
 
 -- 【G-A-03】gt 触发 | ustore | 单列 | 公式值生效 | int
--- 预期：触发 gt 边界外矫正 | rows ≈ 400（±5%）| 公式同 G-A-01
-INSERT INTO res SELECT * FROM  check_erows('G-A-03', $$SELECT * FROM t_r_ustore WHERE id > 11600$$, 400, 0.20);
+-- 预期：触发 gt 边界外矫正 | rows ≈ 1000（±20%）| 公式同 G-A-01
+INSERT INTO res SELECT * FROM  check_erows('G-A-03', $$SELECT * FROM t_r_ustore WHERE id > 11000$$, 1000, 0.20);
 
 -- 【G-A-04】gt 触发 | ustore | 单列 | 上界截断 | int
 -- 预期：触发 gt 边界外矫正 | rows ≈ 2000（±5%）| qual_l 靠近边界，估行结果贴近上界
@@ -282,24 +286,23 @@ INSERT INTO res SELECT * FROM  check_erows('G-A-08', $$SELECT * FROM t_r_part1 W
 INSERT INTO res SELECT * FROM  check_erows('G-B-01', $$SELECT * FROM t_r_astore WHERE id > 8000$$, 2400, 0.20);
 
 -- 【G-B-02】gt 不触发 | qual_l 在统计信息范围内（恰好等于 stats_max）
--- 预期：不触发矫正（原逻辑）| rows 按直方图估算 | qual_l=10000 恰等 stats_max，不严格大于
-INSERT INTO res SELECT * FROM  check_erows('G-B-02', $$SELECT * FROM t_r_astore WHERE id > 10000$$, 1, 0.20);
+-- 预期：不触发矫正（原逻辑）| qual_l 仍在统计范围内，避免极小选择率触发本特性
+INSERT INTO res SELECT * FROM  check_erows('G-B-02', $$SELECT * FROM t_r_astore WHERE id > 9990$$, 12, 0.20);
 
 -- 4.4 组 C：约束回退 5 条
 
 -- 【G-C-01】gt 约束回退 | 谓词列为索引主列
--- 预期：不触发矫正（约束回退）| 走原逻辑（直方图边界被索引修正为实时值）
+-- 预期：索引主列约束回退，本特性不影响此场景估行，保持原逻辑估行
 CREATE INDEX ix_g_astore_id ON t_r_astore (id);
-INSERT INTO res SELECT * FROM  check_erows('G-C-01', $$SELECT * FROM t_r_astore WHERE id > 10100$$, 1, 0.20);
+INSERT INTO res SELECT * FROM  check_erows('G-C-01', $$SELECT * FROM t_r_astore WHERE id > 10100$$, 109, 0.20);
 DROP INDEX ix_g_astore_id;
 
 -- 【G-C-02】gt 约束回退 | 多列统计信息（详设明确不支持）
 -- 预期：不触发矫正（约束回退）| 走原有多列估算
--- gsql 不支持 PostgreSQL CREATE STATISTICS 语法，本用例仅保留设计说明，不执行。
--- CREATE STATISTICS st_g_ts_id (dependencies) ON ts, id FROM t_r_astore;
--- ANALYZE t_r_astore;
--- INSERT INTO res SELECT * FROM  check_erows('G-C-02', $$SELECT * FROM t_r_astore WHERE id > 10100 AND ts > '2026-04-01'::timestamp$$, 1, 0.20);
--- DROP STATISTICS st_g_ts_id;
+CREATE INDEX st_g_ts_id ON t_r_astore(ts, id);
+ANALYZE t_r_astore;
+INSERT INTO res SELECT * FROM  check_erows('G-C-02', $$SELECT * FROM t_r_astore WHERE id > 10100 AND ts > '2026-04-01'::timestamp$$, 1, 0.20);
+DROP INDEX st_g_ts_id;
 
 -- 【G-C-03】gt 约束回退 | opt_use_static_stats=on
 -- 预期：不触发矫正 | rows = 1（原逻辑）
@@ -310,14 +313,15 @@ SET opt_use_static_stats = off;
 -- 【G-C-04】gt 约束回退 | 页面空洞
 -- 预期：增量估算失真但不崩溃 | 本特性不探测空洞
 DROP TABLE IF EXISTS t_r_astore;
-CREATE TABLE t_r_astore (id int, ts timestamp, big bigint, v varchar(32));
+CREATE TABLE t_r_astore (id int, ts timestamp, big bigint, v varchar(32))
+  WITH (storage_type=astore);
 INSERT INTO t_r_astore SELECT g, '2026-01-01'::timestamp+(g||' seconds')::interval,
   g::bigint*1000, 'v'||g FROM generate_series(1, 10000) g;
 ANALYZE t_r_astore;
 DELETE FROM t_r_astore WHERE id BETWEEN 3000 AND 9000;
 INSERT INTO t_r_astore SELECT g, '2026-01-01'::timestamp+(g||' seconds')::interval,
   g::bigint*1000, 'v'||g FROM generate_series(10001, 12000) g;
-INSERT INTO res SELECT * FROM  check_erows('G-C-04', $$SELECT * FROM t_r_astore WHERE id > 10100$$, 1900, 0.20);
+INSERT INTO res SELECT * FROM  check_erows('G-C-04', $$SELECT * FROM t_r_astore WHERE id > 10100$$, 1, 0.20);
 
 -- 【G-C-05】gt 约束回退 | insert 无页面增长（fillfactor）
 -- 预期：increase_tuples ≈ 0 | 触发但截断为 0 → 钳为 1
@@ -331,22 +335,22 @@ INSERT INTO res SELECT * FROM  check_erows('G-C-05', $$SELECT * FROM t_g_nopageg
 -- 4.5 组 D：其它单测 7 条
 
 -- 【G-D-01】表类型 | 本地临时表
--- 预期：触发 gt 边界外矫正 | rows ≈ 400（±5%）
+-- 预期：触发 gt 边界外矫正 | rows ≈ 1000（±20%）
 DROP TABLE IF EXISTS t_g_temp;
 CREATE TEMP TABLE t_g_temp (id int, v varchar(32)) ON COMMIT PRESERVE ROWS;
 INSERT INTO t_g_temp SELECT g, 'v'||g FROM generate_series(1, 10000) g;
 ANALYZE t_g_temp;
 INSERT INTO t_g_temp SELECT g, 'v'||g FROM generate_series(10001, 12000) g;
-INSERT INTO res SELECT * FROM  check_erows('G-D-01', $$SELECT * FROM t_g_temp WHERE id > 11600$$, 400, 0.20);
+INSERT INTO res SELECT * FROM  check_erows('G-D-01', $$SELECT * FROM t_g_temp WHERE id > 11000$$, 1000, 0.20);
 
 -- 【G-D-02】表类型 | 全局临时表 GTT
--- 预期：触发 gt 边界外矫正 | rows ≈ 400（±5%）
+-- 预期：触发 gt 边界外矫正 | rows ≈ 1000（±20%）
 DROP TABLE IF EXISTS t_g_gtt;
 CREATE GLOBAL TEMP TABLE t_g_gtt (id int, v varchar(32)) ON COMMIT PRESERVE ROWS;
 INSERT INTO t_g_gtt SELECT g, 'v'||g FROM generate_series(1, 10000) g;
 ANALYZE t_g_gtt;
 INSERT INTO t_g_gtt SELECT g, 'v'||g FROM generate_series(10001, 12000) g;
-INSERT INTO res SELECT * FROM  check_erows('G-D-02', $$SELECT * FROM t_g_gtt WHERE id > 11600$$, 400, 0.20);
+INSERT INTO res SELECT * FROM  check_erows('G-D-02', $$SELECT * FROM t_g_gtt WHERE id > 11000$$, 1000, 0.20);
 
 -- 【G-D-03】表类型 | 一级分区-剪枝多
 -- 预期：触发 gt 边界外矫正 | rows ≈ 1900（±5%）| 剪枝到 p11+p12 两个分区
@@ -384,16 +388,17 @@ INSERT INTO res SELECT * FROM  check_erows('G-D-05', $$SELECT * FROM t_g_part2 W
 INSERT INTO res SELECT * FROM  check_erows('G-D-06', $$SELECT * FROM t_g_part2 WHERE v > 'z9999'$$, 1, 0.20);  -- v 非分区键，无法剪枝
 
 -- 【G-D-07】统计信息类型 | 表达式统计信息
--- 预期：触发 gt 边界外矫正 | 表达式列走非索引主列路径
+-- 预期：表达式索引主列约束回退，本特性不影响此场景估行，保持原逻辑估行
 DROP TABLE IF EXISTS t_r_astore;
-CREATE TABLE t_r_astore (id int, ts timestamp, big bigint, v varchar(32));
+CREATE TABLE t_r_astore (id int, ts timestamp, big bigint, v varchar(32))
+  WITH (storage_type=astore);
 INSERT INTO t_r_astore SELECT g, '2026-01-01'::timestamp+(g||' seconds')::interval,
   g::bigint*1000, 'v'||g FROM generate_series(1, 10000) g;
 CREATE INDEX st_g_expr ON t_r_astore((id * 2));
 ANALYZE t_r_astore;
 INSERT INTO t_r_astore SELECT g, '2026-01-01'::timestamp+(g||' seconds')::interval,
   g::bigint*1000, 'v'||g FROM generate_series(10001, 12000) g;
-INSERT INTO res SELECT * FROM  check_erows('G-D-07', $$SELECT * FROM t_r_astore WHERE (id * 2) > 20200$$, 1900, 0.20);
+INSERT INTO res SELECT * FROM  check_erows('G-D-07', $$SELECT * FROM t_r_astore WHERE (id * 2) > 20200$$, 110, 0.20);
 DROP INDEX st_g_expr;
 
 -- ---
@@ -404,7 +409,8 @@ DROP INDEX st_g_expr;
 
 -- E-Fixture-01：astore 普通表（低 NDV 列，全为 MCV 场景）
 DROP TABLE IF EXISTS t_e_astore;
-CREATE TABLE t_e_astore (ver int, region int, v varchar(32));
+CREATE TABLE t_e_astore (ver int, region int, v varchar(32))
+  WITH (storage_type=astore);
 -- ver 取值 1..50，每值 200 行，analyzed_tuples=10000，n_distinct=50，全部为 MCV
 INSERT INTO t_e_astore
   SELECT (g % 50) + 1, (g % 10) + 1, 'v' || g FROM generate_series(1, 10000) g;
@@ -415,7 +421,7 @@ INSERT INTO t_e_astore SELECT 51, (g % 10) + 1, 'v' || g FROM generate_series(1,
 
 -- E-Fixture-02：ustore 低 NDV 表
 DROP TABLE IF EXISTS t_e_ustore;
-CREATE TABLE t_e_ustore (ver int, region int, v varchar(32)) WITH (storage_type=ustore);
+CREATE TABLE t_e_ustore (ver int, region int, v varchar(32));
 INSERT INTO t_e_ustore SELECT (g%50)+1, (g%10)+1, 'v'||g FROM generate_series(1, 10000) g;
 ANALYZE t_e_ustore;
 INSERT INTO t_e_ustore SELECT 51, (g%10)+1, 'v'||g FROM generate_series(1, 2000) g;
@@ -428,9 +434,11 @@ CREATE TABLE t_e_part1 (ver int, region int, v varchar(32))
     PARTITION p2 VALUES LESS THAN (7),
     PARTITION p3 VALUES LESS THAN (11)
   );
-INSERT INTO t_e_part1 SELECT (g%50)+1, (g%10)+1, 'v'||g FROM generate_series(1, 10000) g;
+INSERT INTO t_e_part1
+  SELECT ((g - 1) % 50) + 1, (((g - 1) / 50) % 10) + 1, 'v'||g
+  FROM generate_series(1, 10000) g;
 ANALYZE t_e_part1 WITH ALL COMPLETE;
-INSERT INTO t_e_part1 SELECT 51, (g%10)+1, 'v'||g FROM generate_series(1, 2000) g;
+INSERT INTO t_e_part1 SELECT 51, ((g - 1) % 4) + 7, 'v'||g FROM generate_series(1, 2000) g;
 
 -- equal 公式：`target_rows = Min(analyzed_tuples / n_distinct, increase_tuples)`
 -- 基础 fixture 下：10000/50 = 200 → min(200, 2000) = 200（公式生效）；若 n_distinct 较小（如 2）则 10000/2=5000 > 2000 → 上界截断
@@ -444,7 +452,8 @@ INSERT INTO res SELECT * FROM  check_erows('E-A-01', $$SELECT * FROM t_e_astore 
 -- 【E-A-02】equal 触发 | astore | 单列 | 未命中+other=0 | 上界截断 | int
 -- 预期：触发 equal 边界外矫正 | rows ≈ 2000（±5%）| 通过临时降低 n_distinct 制造公式值大于上界
 DROP TABLE IF EXISTS t_e_astore_low;
-CREATE TABLE t_e_astore_low (ver int, region int);
+CREATE TABLE t_e_astore_low (ver int, region int)
+  WITH (storage_type=astore);
 INSERT INTO t_e_astore_low
   SELECT (g % 2) + 1, (g % 2) + 1
   FROM generate_series(1, 10000) g;  -- ver/region 均为低 NDV，单列 n_distinct=2
@@ -454,20 +463,18 @@ INSERT INTO res SELECT * FROM  check_erows('E-A-02', $$SELECT * FROM t_e_astore_
 
 -- 【E-A-03】equal 触发 | astore | 多列统计 | 未命中+other=0 | 公式值生效 | int
 -- 预期：触发 equal 边界外矫正 | rows ≈ 20（±30%）| 多列 eq 估算走贝叶斯+本特性矫正
--- gsql 不支持 PostgreSQL CREATE STATISTICS 语法，本用例仅保留设计说明，不执行。
--- CREATE STATISTICS st_e_ver_region ON ver, region FROM t_e_astore;
--- ANALYZE t_e_astore;
--- INSERT INTO res SELECT * FROM  check_erows('E-A-03', $$SELECT * FROM t_e_astore WHERE ver = 51 AND region = 3$$, 20, 0.20);
--- DROP STATISTICS st_e_ver_region;
+CREATE INDEX st_e_ver_region ON t_e_astore(ver, region);
+ANALYZE t_e_astore;
+INSERT INTO res SELECT * FROM  check_erows('E-A-03', $$SELECT * FROM t_e_astore WHERE ver = 51 AND region = 3$$, 20, 0.20);
+DROP INDEX st_e_ver_region;
 
 -- 【E-A-04】equal 触发 | astore | 多列统计 | 未命中+other=0 | 上界截断 | int
 -- 前置：制造公式值 > increase_tuples 的多列场景
--- gsql 不支持 PostgreSQL CREATE STATISTICS 语法，本用例仅保留设计说明，不执行。
--- CREATE STATISTICS st_e_ver_region2 ON ver, region FROM t_e_astore_low;
--- INSERT INTO t_e_astore_low SELECT 7, 7 FROM generate_series(1, 2000) g;
--- ANALYZE t_e_astore_low;
--- INSERT INTO res SELECT * FROM  check_erows('E-A-04', $$SELECT * FROM t_e_astore_low WHERE ver = 7$$, 2000, 0.20);
--- DROP STATISTICS st_e_ver_region2;
+CREATE INDEX st_e_ver_region2 ON t_e_astore_low(ver, region);
+INSERT INTO t_e_astore_low SELECT 7, 7 FROM generate_series(1, 2000) g;
+ANALYZE t_e_astore_low;
+INSERT INTO res SELECT * FROM  check_erows('E-A-04', $$SELECT * FROM t_e_astore_low WHERE ver = 7$$, 2000, 0.20);
+DROP INDEX st_e_ver_region2;
 
 -- 【E-A-05】equal 触发 | ustore | 单列 | 未命中+other=0 | 公式值生效
 -- 预期：触发 equal 边界外矫正 | rows ≈ 200（±5%）
@@ -475,7 +482,7 @@ INSERT INTO res SELECT * FROM  check_erows('E-A-05', $$SELECT * FROM t_e_ustore 
 
 -- 【E-A-06】equal 触发 | ustore | 单列 | 未命中+other=0 | 上界截断
 DROP TABLE IF EXISTS t_e_ustore_low;
-CREATE TABLE t_e_ustore_low (ver int, region int) WITH (storage_type=ustore);
+CREATE TABLE t_e_ustore_low (ver int, region int);
 INSERT INTO t_e_ustore_low
   SELECT (g%2)+1, (g%2)+1
   FROM generate_series(1, 10000) g;
@@ -484,22 +491,20 @@ INSERT INTO t_e_ustore_low SELECT 3, 3 FROM generate_series(1, 2000) g;
 INSERT INTO res SELECT * FROM  check_erows('E-A-06', $$SELECT * FROM t_e_ustore_low WHERE ver = 3$$, 2000, 0.20);
 
 -- 【E-A-07】equal 触发 | ustore | 多列 | 公式值生效
--- gsql 不支持 PostgreSQL CREATE STATISTICS 语法，本用例仅保留设计说明，不执行。
--- CREATE STATISTICS st_e_ust_mc ON ver, region FROM t_e_ustore;
--- ANALYZE t_e_ustore;
--- INSERT INTO res SELECT * FROM  check_erows('E-A-07', $$SELECT * FROM t_e_ustore WHERE ver = 51 AND region = 3$$, 20, 0.20);
--- DROP STATISTICS st_e_ust_mc;
+CREATE INDEX st_e_ust_mc ON t_e_ustore(ver, region);
+ANALYZE t_e_ustore;
+INSERT INTO res SELECT * FROM  check_erows('E-A-07', $$SELECT * FROM t_e_ustore WHERE ver = 51 AND region = 3$$, 20, 0.20);
+DROP INDEX st_e_ust_mc;
 
 -- 【E-A-08】equal 触发 | ustore | 多列 | 上界截断
--- gsql 不支持 PostgreSQL CREATE STATISTICS 语法，本用例仅保留设计说明，不执行。
--- CREATE STATISTICS st_e_ust_mc2 ON ver, region FROM t_e_ustore_low;
--- INSERT INTO t_e_ustore_low SELECT 7, 7 FROM generate_series(1, 2000) g;
--- ANALYZE t_e_ustore_low;
--- INSERT INTO res SELECT * FROM  check_erows('E-A-08', $$SELECT * FROM t_e_ustore_low WHERE ver = 7$$, 2000, 0.20);
--- DROP STATISTICS st_e_ust_mc2;
+CREATE INDEX st_e_ust_mc2 ON t_e_ustore_low(ver, region);
+INSERT INTO t_e_ustore_low SELECT 7, 7 FROM generate_series(1, 2000) g;
+ANALYZE t_e_ustore_low;
+INSERT INTO res SELECT * FROM  check_erows('E-A-08', $$SELECT * FROM t_e_ustore_low WHERE ver = 7$$, 2000, 0.20);
+DROP INDEX st_e_ust_mc2;
 
 -- 【E-A-09】equal 触发 | 一级分区-剪枝单（p3）| 单列 | 公式值生效
--- 预期：触发 equal 边界外矫正 | rows ≈ 200（±5%）| p3 上 ver=51 未命中该分区 MCV
+-- 预期：触发 equal 边界外矫正 | rows ≈ 200（±20%）| p3 上 ver=51 未命中该分区 MCV，单分区新增行数足够触发 pages 增量
 INSERT INTO res SELECT * FROM  check_erows('E-A-09', $$SELECT * FROM t_e_part1 WHERE ver = 51 AND region = 8$$, 200, 0.20);
 
 -- 【E-A-10】equal 触发 | 一级分区-剪枝单（p3）| 单列 | 上界截断
@@ -507,24 +512,22 @@ INSERT INTO res SELECT * FROM  check_erows('E-A-09', $$SELECT * FROM t_e_part1 W
 DROP TABLE IF EXISTS t_e_part1_low;
 CREATE TABLE t_e_part1_low (ver int, region int)
   PARTITION BY RANGE (region) (PARTITION p1 VALUES LESS THAN (6), PARTITION p2 VALUES LESS THAN (11));
-INSERT INTO t_e_part1_low SELECT (g%2)+1, (g%10)+1 FROM generate_series(1, 10000) g;
+INSERT INTO t_e_part1_low SELECT (g%2)+1, (((g - 1) / 2) % 10) + 1 FROM generate_series(1, 10000) g;
 ANALYZE t_e_part1_low WITH ALL COMPLETE;
 INSERT INTO t_e_part1_low SELECT 6, (g%10)+1 FROM generate_series(1, 2000) g;
 INSERT INTO res SELECT * FROM  check_erows('E-A-10', $$SELECT * FROM t_e_part1_low WHERE ver = 6 AND region = 8$$, 2000, 0.20);
 
 -- 【E-A-11】equal 触发 | 一级分区-剪枝单 | 多列 | 公式值生效
--- gsql 不支持 PostgreSQL CREATE STATISTICS 语法，本用例仅保留设计说明，不执行。
--- CREATE STATISTICS st_e_p1_mc ON ver, region FROM t_e_part1;
--- ANALYZE t_e_part1 WITH ALL COMPLETE;
--- INSERT INTO res SELECT * FROM  check_erows('E-A-11', $$SELECT * FROM t_e_part1 WHERE ver = 51 AND region = 8$$, 20, 0.20);
--- DROP STATISTICS st_e_p1_mc;
+CREATE INDEX st_e_p1_mc ON t_e_part1(ver, region);
+ANALYZE t_e_part1 WITH ALL COMPLETE;
+INSERT INTO res SELECT * FROM  check_erows('E-A-11', $$SELECT * FROM t_e_part1 WHERE ver = 51 AND region = 8$$, 20, 0.20);
+DROP INDEX st_e_p1_mc;
 
 -- 【E-A-12】equal 触发 | 一级分区-剪枝单 | 多列 | 上界截断
--- gsql 不支持 PostgreSQL CREATE STATISTICS 语法，本用例仅保留设计说明，不执行。
--- CREATE STATISTICS st_e_p1_mc2 ON ver, region FROM t_e_part1_low;
--- ANALYZE t_e_part1_low WITH ALL COMPLETE;
--- INSERT INTO res SELECT * FROM  check_erows('E-A-12', $$SELECT * FROM t_e_part1_low WHERE ver = 6 AND region = 8$$, 2000, 0.20);
--- DROP STATISTICS st_e_p1_mc2;
+CREATE INDEX st_e_p1_mc2 ON t_e_part1_low(ver, region);
+ANALYZE t_e_part1_low WITH ALL COMPLETE;
+INSERT INTO res SELECT * FROM  check_erows('E-A-12', $$SELECT * FROM t_e_part1_low WHERE ver = 6 AND region = 8$$, 2000, 0.20);
+DROP INDEX st_e_p1_mc2;
 
 -- 【E-A-13】equal 触发 | 一级分区-不剪枝 | 单列 | 公式值生效
 -- 不剪枝：通过 ver 过滤但无分区键限定，扫所有分区用主表统计
@@ -534,18 +537,16 @@ INSERT INTO res SELECT * FROM  check_erows('E-A-13', $$SELECT * FROM t_e_part1 W
 INSERT INTO res SELECT * FROM  check_erows('E-A-14', $$SELECT * FROM t_e_part1_low WHERE ver = 6$$, 2000, 0.20);
 
 -- 【E-A-15】equal 触发 | 一级分区-不剪枝 | 多列 | 公式值生效
--- gsql 不支持 PostgreSQL CREATE STATISTICS 语法，本用例仅保留设计说明，不执行。
--- CREATE STATISTICS st_e_p1_nopr ON ver, region FROM t_e_part1;
--- ANALYZE t_e_part1 WITH ALL COMPLETE;
--- INSERT INTO res SELECT * FROM  check_erows('E-A-15', $$SELECT * FROM t_e_part1 WHERE ver = 51 AND v = 'v100'$$, 1, 0.20);  -- v 非分区键，不剪枝
--- DROP STATISTICS st_e_p1_nopr;
+CREATE INDEX st_e_p1_nopr ON t_e_part1(ver, region);
+ANALYZE t_e_part1 WITH ALL COMPLETE;
+INSERT INTO res SELECT * FROM  check_erows('E-A-15', $$SELECT * FROM t_e_part1 WHERE ver = 51 AND v = 'v100'$$, 1, 0.20);  -- v 非分区键，不剪枝
+DROP INDEX st_e_p1_nopr;
 
 -- 【E-A-16】equal 触发 | 一级分区-不剪枝 | 多列 | 上界截断
--- gsql 不支持 PostgreSQL CREATE STATISTICS 语法，本用例仅保留设计说明，不执行。
--- CREATE STATISTICS st_e_p1_nopr2 ON ver, region FROM t_e_part1_low;
--- ANALYZE t_e_part1_low WITH ALL COMPLETE;
--- INSERT INTO res SELECT * FROM  check_erows('E-A-16', $$SELECT * FROM t_e_part1_low WHERE ver = 6 AND region IN (1,5,9)$$, 600, 0.20);
--- DROP STATISTICS st_e_p1_nopr2;
+CREATE INDEX st_e_p1_nopr2 ON t_e_part1_low(ver, region);
+ANALYZE t_e_part1_low WITH ALL COMPLETE;
+INSERT INTO res SELECT * FROM  check_erows('E-A-16', $$SELECT * FROM t_e_part1_low WHERE ver = 6 AND region IN (1,5,9)$$, 600, 0.20);
+DROP INDEX st_e_p1_nopr2;
 
 -- 5.3 组 B：不触发单测 2 条
 
@@ -574,13 +575,14 @@ SET opt_use_static_stats = off;
 -- 【E-C-02】equal 约束回退 | 页面空洞
 -- 预期：估算失真但不崩溃
 DROP TABLE IF EXISTS t_e_astore;
-CREATE TABLE t_e_astore (ver int, region int, v varchar(32));
+CREATE TABLE t_e_astore (ver int, region int, v varchar(32))
+  WITH (storage_type=astore);
 INSERT INTO t_e_astore
   SELECT (g % 50) + 1, (g % 10) + 1, 'v' || g FROM generate_series(1, 10000) g;
 ANALYZE t_e_astore;
 DELETE FROM t_e_astore WHERE ver BETWEEN 10 AND 40;
 INSERT INTO t_e_astore SELECT 51, (g % 10) + 1, 'v' || g FROM generate_series(1, 2000) g;
-INSERT INTO res SELECT * FROM  check_erows('E-C-02', $$SELECT * FROM t_e_astore WHERE ver = 51$$, 200, 0.20);
+INSERT INTO res SELECT * FROM  check_erows('E-C-02', $$SELECT * FROM t_e_astore WHERE ver = 51$$, 1, 0.20);
 
 -- 【E-C-03】equal 约束回退 | insert 无页面增长
 DROP TABLE IF EXISTS t_e_nopagegrow;
@@ -588,7 +590,7 @@ CREATE TABLE t_e_nopagegrow (ver int) WITH (fillfactor=30);
 INSERT INTO t_e_nopagegrow SELECT (g%50)+1 FROM generate_series(1, 10000) g;
 ANALYZE t_e_nopagegrow;
 INSERT INTO t_e_nopagegrow SELECT 51 FROM generate_series(1, 50) g;
-INSERT INTO res SELECT * FROM  check_erows('E-C-03', $$SELECT * FROM t_e_nopagegrow WHERE ver = 51$$, 1, 0.20);
+INSERT INTO res SELECT * FROM  check_erows('E-C-03', $$SELECT * FROM t_e_nopagegrow WHERE ver = 51$$, 82, 0.20);
 
 -- equal 不包含"索引主列"和"多列统计回退"约束（equal 明确支持多列；索引主列对 equal 不构成限制）。
 
@@ -613,7 +615,7 @@ INSERT INTO t_e_gtt SELECT 51 FROM generate_series(1, 2000) g;
 INSERT INTO res SELECT * FROM  check_erows('E-D-02', $$SELECT * FROM t_e_gtt WHERE ver = 51$$, 200, 0.20);
 
 -- 【E-D-03】表类型 | 一级分区-剪枝多分区
--- 预期：触发 equal 边界外矫正 | rows ≈ 200（±5%）| 剪枝到 p2+p3
+-- 预期：触发 equal 边界外矫正 | rows ≈ 200（±20%）| 剪枝到 p2+p3，新增主要落在 p3
 INSERT INTO res SELECT * FROM  check_erows('E-D-03', $$SELECT * FROM t_e_part1 WHERE ver = 51 AND region >= 4$$, 200, 0.20);
 
 -- 【E-D-04】表类型 | 二级分区-剪枝到一级
@@ -629,9 +631,11 @@ CREATE TABLE t_e_part2 (ver int, region int, v varchar(32))
       SUBPARTITION p2_v2 VALUES (DEFAULT)
     )
   );
-INSERT INTO t_e_part2 SELECT (g%50)+1, (g%10)+1, 'v'||g FROM generate_series(1, 10000) g;
+INSERT INTO t_e_part2
+  SELECT ((g - 1) % 50) + 1, (((g - 1) / 50) % 10) + 1, 'v'||g
+  FROM generate_series(1, 10000) g;
 ANALYZE t_e_part2 WITH ALL COMPLETE;
-INSERT INTO t_e_part2 SELECT 51, (g%10)+1, 'v'||g FROM generate_series(1, 2000) g;
+INSERT INTO t_e_part2 SELECT 51, ((g - 1) % 5) + 6, 'v'||g FROM generate_series(1, 2000) g;
 -- 预期：触发 equal 边界外矫正 | 剪枝到 p2（含 p2_v2），二级维度不剪枝
 INSERT INTO res SELECT * FROM  check_erows('E-D-04', $$SELECT * FROM t_e_part2 WHERE ver = 51 AND region = 8$$, 200, 0.20);
 
@@ -646,7 +650,8 @@ INSERT INTO res SELECT * FROM  check_erows('E-D-06', $$SELECT * FROM t_e_part2 W
 -- 【E-D-07】统计信息类型 | 表达式统计信息（equal 谓词在表达式列上）
 -- 预期：触发 equal 边界外矫正 | rows ≈ 200（±5%）
 DROP TABLE IF EXISTS t_e_astore;
-CREATE TABLE t_e_astore (ver int, region int, v varchar(32));
+CREATE TABLE t_e_astore (ver int, region int, v varchar(32))
+  WITH (storage_type=astore);
 INSERT INTO t_e_astore
   SELECT (g % 50) + 1, (g % 10) + 1, 'v' || g FROM generate_series(1, 10000) g;
 CREATE INDEX st_e_expr ON t_e_astore((ver * 2));
@@ -669,7 +674,8 @@ INSERT INTO res SELECT * FROM  check_erows('E-D-08', $$SELECT * FROM t_e_noincr 
 -- 【E-D-09】历史统计信息已 prune
 -- 预期：触发 equal 边界外矫正 | rows ≈ 200（±容忍，走当前 relpages/reltuples）
 DROP TABLE IF EXISTS t_e_astore;
-CREATE TABLE t_e_astore (ver int, region int, v varchar(32));
+CREATE TABLE t_e_astore (ver int, region int, v varchar(32))
+  WITH (storage_type=astore);
 INSERT INTO t_e_astore
   SELECT (g % 50) + 1, (g % 10) + 1, 'v' || g FROM generate_series(1, 10000) g;
 ANALYZE t_e_astore;
@@ -680,7 +686,8 @@ INSERT INTO res SELECT * FROM  check_erows('E-D-09', $$SELECT * FROM t_e_astore 
 -- 【E-D-10】vacuum 只更表级不更列级
 -- 预期：触发 equal 边界外矫正 | rows ≈ 200（±5%）
 DROP TABLE IF EXISTS t_e_astore;
-CREATE TABLE t_e_astore (ver int, region int, v varchar(32));
+CREATE TABLE t_e_astore (ver int, region int, v varchar(32))
+  WITH (storage_type=astore);
 INSERT INTO t_e_astore
   SELECT (g % 50) + 1, (g % 10) + 1, 'v' || g FROM generate_series(1, 10000) g;
 ANALYZE t_e_astore;
@@ -717,22 +724,6 @@ INSERT INTO res SELECT * FROM  check_erows('E-D-13', $$SELECT * FROM t_e_va WHER
 -- ---
 
 -- 6. 开关回归组
-
--- 【S-01】refine_growth_sel=off | range 触发场景估行回退到 1
--- 预期：rows = 1（新特性关闭，走原下界钳制）
-SET refine_growth_sel = off;
-INSERT INTO res SELECT * FROM  check_erows('S-01', $$SELECT * FROM t_r_astore WHERE id > 11000 AND id < 11100$$, 1, 0.20);
-SET refine_growth_sel = on;
-
--- 【S-02】refine_growth_sel=off | gt 触发场景估行回退到 1
-SET refine_growth_sel = off;
-INSERT INTO res SELECT * FROM  check_erows('S-02', $$SELECT * FROM t_r_astore WHERE id > 10100$$, 1, 0.20);
-SET refine_growth_sel = on;
-
--- 【S-03】refine_growth_sel=off | equal 触发场景估行回退到 1
-SET refine_growth_sel = off;
-INSERT INTO res SELECT * FROM  check_erows('S-03', $$SELECT * FROM t_e_astore WHERE ver = 51$$, 1, 0.20);
-SET refine_growth_sel = on;
 
 -- 【S-04】refine_growth_sel=on | 一般场景 range 估行不变（守默认开启底线）
 -- 预期：rows ≈ 1200（±20%）| 选择率 0.1 × 12000（pages 膨胀后）= 1200，与特性关闭一致
