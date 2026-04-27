@@ -192,7 +192,7 @@ INSERT INTO res SELECT * FROM  check_erows('R-D-04', $$SELECT * FROM t_r_noincr 
 
 -- 【R-D-05】历史统计信息已 prune（回退 estimate_rel_size 当前值）
 -- 预期：触发 range 边界外矫正 | rows ≈ 100（±20%）| 历史统计被清后由当前 relpages/reltuples 代替
---   重建 + 用 DBMS_STATS.PURGE_STATS 清历史
+--   重建 + 用 DBE_STATS.PURGE_STATS 清历史
 DROP TABLE IF EXISTS t_r_astore;
 CREATE TABLE t_r_astore (id int, ts timestamp, big bigint, v varchar(32));
 INSERT INTO t_r_astore SELECT g, '2026-01-01'::timestamp+(g||' seconds')::interval,
@@ -200,7 +200,7 @@ INSERT INTO t_r_astore SELECT g, '2026-01-01'::timestamp+(g||' seconds')::interv
 ANALYZE t_r_astore;
 INSERT INTO t_r_astore SELECT g, '2026-01-01'::timestamp+(g||' seconds')::interval,
   g::bigint*1000, 'v'||g FROM generate_series(10001, 12000) g;
-CALL "DBMS_STATS".PURGE_STATS(current_timestamp);
+CALL "DBE_STATS".PURGE_STATS(current_timestamp);
 INSERT INTO res SELECT * FROM  check_erows('R-D-05', $$SELECT * FROM t_r_astore WHERE id > 11000 AND id < 11100$$, 100, 0.20);
 
 -- 【R-D-06】vacuum 只更表级不更列级
@@ -674,7 +674,7 @@ INSERT INTO t_e_astore
   SELECT (g % 50) + 1, (g % 10) + 1, 'v' || g FROM generate_series(1, 10000) g;
 ANALYZE t_e_astore;
 INSERT INTO t_e_astore SELECT 51, (g % 10) + 1, 'v' || g FROM generate_series(1, 2000) g;
-CALL "DBMS_STATS".PURGE_STATS(current_timestamp);
+CALL "DBE_STATS".PURGE_STATS(current_timestamp);
 INSERT INTO res SELECT * FROM  check_erows('E-D-09', $$SELECT * FROM t_e_astore WHERE ver = 51$$, 200, 0.20);
 
 -- 【E-D-10】vacuum 只更表级不更列级
