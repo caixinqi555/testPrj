@@ -582,7 +582,7 @@ DROP INDEX st_e_ust_mc2;
 -- 预期：触发 equal 边界外矫正 | rows ≈ 500（±20%）| p2 上每个 ver 的分区局部密度为 500，新增在 p2 也保持 500
 INSERT INTO res SELECT * FROM  check_erows('E-A-09', $$SELECT * FROM t_e_part1 WHERE region = 3$$, 1000, 0.20);
 -- 预期：触发 equal 边界外矫正 | rows ≈ 500（±20%）| p2 上每个 ver 的分区局部密度为 500，新增在 p2 也保持 500
--- 【E-A-10】equal 触发 | 一级分区-剪枝单（p2）| 单列 | 上界截断
+-- 【E-A-10】equal 触发 | 一级分区-目标分区 analyze 时为空 | 单列 | 上界截断
 -- 前置：一级分区-低 NDV
 DROP TABLE IF EXISTS t_e_part1_low;
 CREATE TABLE t_e_part1_low (ver int, region int)
@@ -590,7 +590,8 @@ CREATE TABLE t_e_part1_low (ver int, region int)
 INSERT INTO t_e_part1_low SELECT (g%2)+1, (((g - 1) / 2) % 2) + 1 FROM generate_series(1, 10000) g;
 ANALYZE t_e_part1_low WITH ALL COMPLETE;
 INSERT INTO t_e_part1_low SELECT (g%2)+1, 3 FROM generate_series(1, 5000) g;
-INSERT INTO res SELECT * FROM  check_erows('E-A-10', $$SELECT * FROM t_e_part1_low WHERE region = 3$$, 5000, 0.20);
+-- 预期：analyze 时目标分区为空，优化器使用全表统计信息，10000/4=2500
+INSERT INTO res SELECT * FROM  check_erows('E-A-10', $$SELECT * FROM t_e_part1_low WHERE region = 3$$, 2500, 0.20);
 
 -- 【E-A-11】equal 触发 | 一级分区-剪枝单 | 多列 | 公式值生效
 DROP TABLE IF EXISTS t_e_part1;
@@ -725,7 +726,7 @@ CREATE TABLE t_e_ustore_hole (ver int, region int, v varchar(32));
 INSERT INTO t_e_ustore_hole
   SELECT ((g - 1) % 10) + 1, (((g - 1) / 10) % 2) + 1, 'v' || g FROM generate_series(1, 10000) g;
 ANALYZE t_e_ustore_hole;
-DELETE FROM t_e_ustore_hole WHERE ver BETWEEN 10 AND 40;
+DELETE FROM t_e_ustore_hole WHERE ver BETWEEN 5 AND 40;
 INSERT INTO t_e_ustore_hole SELECT 51, ((g - 1) % 2) + 1, 'v' || g FROM generate_series(1, 1000) g;
 INSERT INTO res SELECT * FROM  check_erows('E-C-02-U', $$SELECT * FROM t_e_ustore_hole WHERE ver = 51$$, 1, 0.20);
 
