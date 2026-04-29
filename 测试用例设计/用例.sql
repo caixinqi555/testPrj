@@ -238,6 +238,59 @@ INSERT INTO t_r_astore SELECT g, '2026-01-01'::timestamp+(g||' seconds')::interv
 VACUUM t_r_astore;   -- 更新 pg_class.relpages/reltuples，不更新 pg_statistic 列级统计
 INSERT INTO res SELECT * FROM  check_erows('R-D-06', $$SELECT * FROM t_r_astore WHERE id > 11000 AND id < 11100$$, 100, 0.20);
 
+-- 【R-D-07】分区剪枝后存在 local 索引 | range 不修正
+-- 预期：剪枝后命中 local 索引主列约束，回退原估行
+DROP TABLE IF EXISTS t_r_part_local;
+CREATE TABLE t_r_part_local (id int, ts timestamp, big bigint, v varchar(32))
+  PARTITION BY RANGE (id) (
+    PARTITION p_old VALUES LESS THAN (10001),
+    PARTITION p_new VALUES LESS THAN (12001)
+  );
+INSERT INTO t_r_part_local SELECT g, '2026-01-01'::timestamp+(g||' seconds')::interval,
+  g::bigint*1000, 'v'||g FROM generate_series(1, 10000) g;
+CREATE INDEX ix_r_part_local_id ON t_r_part_local(id) LOCAL;
+ANALYZE t_r_part_local WITH ALL COMPLETE;
+INSERT INTO t_r_part_local SELECT g, '2026-01-01'::timestamp+(g||' seconds')::interval,
+  g::bigint*1000, 'v'||g FROM generate_series(10001, 12000) g;
+INSERT INTO res SELECT * FROM  check_erows('R-D-07', $$SELECT * FROM t_r_part_local WHERE id > 11000 AND id < 11100$$, 6, 0.20);
+
+-- 【R-D-08】指定分区查询 | range 触发
+-- 预期：显式指定新增分区，仍按分区存储层增量触发 range 矫正
+DROP TABLE IF EXISTS t_r_part_spec;
+CREATE TABLE t_r_part_spec (id int, ts timestamp, big bigint, v varchar(32))
+  PARTITION BY RANGE (id) (
+    PARTITION p_old VALUES LESS THAN (10001),
+    PARTITION p_new VALUES LESS THAN (12001)
+  );
+INSERT INTO t_r_part_spec SELECT g, '2026-01-01'::timestamp+(g||' seconds')::interval,
+  g::bigint*1000, 'v'||g FROM generate_series(1, 10000) g;
+ANALYZE t_r_part_spec WITH ALL COMPLETE;
+INSERT INTO t_r_part_spec SELECT g, '2026-01-01'::timestamp+(g||' seconds')::interval,
+  g::bigint*1000, 'v'||g FROM generate_series(10001, 12000) g;
+INSERT INTO res SELECT * FROM  check_erows('R-D-08', $$SELECT * FROM t_r_part_spec PARTITION (p_new) WHERE id > 11000 AND id < 11100$$, 100, 0.20);
+
+-- 【R-D-09】子查询 | range 触发
+-- 预期：外层 range 谓词下推后仍触发边界外矫正
+DROP TABLE IF EXISTS t_r_subq;
+CREATE TABLE t_r_subq (id int, ts timestamp, big bigint, v varchar(32));
+INSERT INTO t_r_subq SELECT g, '2026-01-01'::timestamp+(g||' seconds')::interval,
+  g::bigint*1000, 'v'||g FROM generate_series(1, 10000) g;
+ANALYZE t_r_subq;
+INSERT INTO t_r_subq SELECT g, '2026-01-01'::timestamp+(g||' seconds')::interval,
+  g::bigint*1000, 'v'||g FROM generate_series(10001, 12000) g;
+INSERT INTO res SELECT * FROM  check_erows('R-D-09', $$SELECT * FROM (SELECT * FROM t_r_subq) s WHERE id > 11000 AND id < 11100$$, 100, 0.20);
+
+-- 【R-D-10】CTE | range 触发
+-- 预期：CTE 包装后仍触发边界外矫正
+DROP TABLE IF EXISTS t_r_cte;
+CREATE TABLE t_r_cte (id int, ts timestamp, big bigint, v varchar(32));
+INSERT INTO t_r_cte SELECT g, '2026-01-01'::timestamp+(g||' seconds')::interval,
+  g::bigint*1000, 'v'||g FROM generate_series(1, 10000) g;
+ANALYZE t_r_cte;
+INSERT INTO t_r_cte SELECT g, '2026-01-01'::timestamp+(g||' seconds')::interval,
+  g::bigint*1000, 'v'||g FROM generate_series(10001, 12000) g;
+INSERT INTO res SELECT * FROM  check_erows('R-D-10', $$WITH q AS (SELECT * FROM t_r_cte) SELECT * FROM q WHERE id > 11000 AND id < 11100$$, 100, 0.20);
+
 -- ---
 
 -- 4. Gt 谓词用例组
@@ -449,6 +502,59 @@ INSERT INTO t_r_astore SELECT g, '2026-01-01'::timestamp+(g||' seconds')::interv
   g::bigint*1000, 'v'||g FROM generate_series(10001, 12000) g;
 INSERT INTO res SELECT * FROM  check_erows('G-D-07', $$SELECT * FROM t_r_astore WHERE (id * 2) > 20200$$, 110, 0.20);
 DROP INDEX st_g_expr;
+
+-- 【G-D-08】分区剪枝后存在 local 索引 | gt 不修正
+-- 预期：剪枝后命中 local 索引主列约束，回退原估行
+DROP TABLE IF EXISTS t_g_part_local;
+CREATE TABLE t_g_part_local (id int, ts timestamp, big bigint, v varchar(32))
+  PARTITION BY RANGE (id) (
+    PARTITION p_old VALUES LESS THAN (10001),
+    PARTITION p_new VALUES LESS THAN (12001)
+  );
+INSERT INTO t_g_part_local SELECT g, '2026-01-01'::timestamp+(g||' seconds')::interval,
+  g::bigint*1000, 'v'||g FROM generate_series(1, 10000) g;
+CREATE INDEX ix_g_part_local_id ON t_g_part_local(id) LOCAL;
+ANALYZE t_g_part_local WITH ALL COMPLETE;
+INSERT INTO t_g_part_local SELECT g, '2026-01-01'::timestamp+(g||' seconds')::interval,
+  g::bigint*1000, 'v'||g FROM generate_series(10001, 12000) g;
+INSERT INTO res SELECT * FROM  check_erows('G-D-08', $$SELECT * FROM t_g_part_local WHERE id > 10100$$, 110, 0.20);
+
+-- 【G-D-09】指定分区查询 | gt 触发
+-- 预期：显式指定新增分区，仍按分区存储层增量触发 gt 矫正
+DROP TABLE IF EXISTS t_g_part_spec;
+CREATE TABLE t_g_part_spec (id int, ts timestamp, big bigint, v varchar(32))
+  PARTITION BY RANGE (id) (
+    PARTITION p_old VALUES LESS THAN (10001),
+    PARTITION p_new VALUES LESS THAN (12001)
+  );
+INSERT INTO t_g_part_spec SELECT g, '2026-01-01'::timestamp+(g||' seconds')::interval,
+  g::bigint*1000, 'v'||g FROM generate_series(1, 10000) g;
+ANALYZE t_g_part_spec WITH ALL COMPLETE;
+INSERT INTO t_g_part_spec SELECT g, '2026-01-01'::timestamp+(g||' seconds')::interval,
+  g::bigint*1000, 'v'||g FROM generate_series(10001, 12000) g;
+INSERT INTO res SELECT * FROM  check_erows('G-D-09', $$SELECT * FROM t_g_part_spec PARTITION (p_new) WHERE id > 11000$$, 1000, 0.20);
+
+-- 【G-D-10】子查询 | gt 触发
+-- 预期：外层 gt 谓词下推后仍触发边界外矫正
+DROP TABLE IF EXISTS t_g_subq;
+CREATE TABLE t_g_subq (id int, ts timestamp, big bigint, v varchar(32));
+INSERT INTO t_g_subq SELECT g, '2026-01-01'::timestamp+(g||' seconds')::interval,
+  g::bigint*1000, 'v'||g FROM generate_series(1, 10000) g;
+ANALYZE t_g_subq;
+INSERT INTO t_g_subq SELECT g, '2026-01-01'::timestamp+(g||' seconds')::interval,
+  g::bigint*1000, 'v'||g FROM generate_series(10001, 12000) g;
+INSERT INTO res SELECT * FROM  check_erows('G-D-10', $$SELECT * FROM (SELECT * FROM t_g_subq) s WHERE id > 11000$$, 1000, 0.20);
+
+-- 【G-D-11】CTE | gt 触发
+-- 预期：CTE 包装后仍触发边界外矫正
+DROP TABLE IF EXISTS t_g_cte;
+CREATE TABLE t_g_cte (id int, ts timestamp, big bigint, v varchar(32));
+INSERT INTO t_g_cte SELECT g, '2026-01-01'::timestamp+(g||' seconds')::interval,
+  g::bigint*1000, 'v'||g FROM generate_series(1, 10000) g;
+ANALYZE t_g_cte;
+INSERT INTO t_g_cte SELECT g, '2026-01-01'::timestamp+(g||' seconds')::interval,
+  g::bigint*1000, 'v'||g FROM generate_series(10001, 12000) g;
+INSERT INTO res SELECT * FROM  check_erows('G-D-11', $$WITH q AS (SELECT * FROM t_g_cte) SELECT * FROM q WHERE id > 11000$$, 1000, 0.20);
 
 -- ---
 
@@ -899,7 +1005,58 @@ ANALYZE t_e_va;
 INSERT INTO t_e_va SELECT 'ver999' FROM generate_series(1, 1000) g;
 INSERT INTO res SELECT * FROM  check_erows('E-D-13', $$SELECT * FROM t_e_va WHERE v = 'ver999'$$, 1000, 0.30);
 
--- 实际对应规模测算（D 组 20 条）：range D 6 + gt D 7 + equal D 13 = 26，稍超出原预算（20），但覆盖更完整，后续可砍合并。
+-- 【E-D-14】分区剪枝后存在 local 索引 | equal 不修正
+-- 预期：剪枝后命中 local 索引主列约束，回退原估行
+DROP TABLE IF EXISTS t_e_part_local;
+CREATE TABLE t_e_part_local (ver int, region int, v varchar(32))
+  PARTITION BY RANGE (region) (
+    PARTITION p_old VALUES LESS THAN (3),
+    PARTITION p_new VALUES LESS THAN (4)
+  );
+INSERT INTO t_e_part_local
+  SELECT ((g - 1) % 10) + 1, ((floor((g - 1)::numeric / 10)::int % 2) + 1), 'v'||g
+  FROM generate_series(1, 10000) g;
+CREATE INDEX ix_e_part_local_region ON t_e_part_local(region) LOCAL;
+ANALYZE t_e_part_local WITH ALL COMPLETE;
+INSERT INTO t_e_part_local SELECT ((g - 1) % 10) + 1, 3, 'v'||g FROM generate_series(1, 1000) g;
+INSERT INTO res SELECT * FROM  check_erows('E-D-14', $$SELECT * FROM t_e_part_local WHERE region = 3$$, 1, 0.20);
+
+-- 【E-D-15】指定分区查询 | equal 触发
+-- 预期：显式指定新增分区，仍按分区存储层增量触发 equal 矫正
+DROP TABLE IF EXISTS t_e_part_spec;
+CREATE TABLE t_e_part_spec (ver int, region int, v varchar(32))
+  PARTITION BY RANGE (region) (
+    PARTITION p_old VALUES LESS THAN (3),
+    PARTITION p_new VALUES LESS THAN (4)
+  );
+INSERT INTO t_e_part_spec
+  SELECT ((g - 1) % 10) + 1, ((floor((g - 1)::numeric / 10)::int % 2) + 1), 'v'||g
+  FROM generate_series(1, 10000) g;
+ANALYZE t_e_part_spec WITH ALL COMPLETE;
+INSERT INTO t_e_part_spec SELECT ((g - 1) % 10) + 1, 3, 'v'||g FROM generate_series(1, 1000) g;
+INSERT INTO res SELECT * FROM  check_erows('E-D-15', $$SELECT * FROM t_e_part_spec PARTITION (p_new) WHERE region = 3$$, 1000, 0.20);
+
+-- 【E-D-16】子查询 | equal 触发
+-- 预期：外层 equal 谓词下推后仍触发边界外矫正
+DROP TABLE IF EXISTS t_e_subq;
+CREATE TABLE t_e_subq (ver int, region int, v varchar(32));
+INSERT INTO t_e_subq
+  SELECT ((g - 1) % 10) + 1, ((floor((g - 1)::numeric / 10)::int % 2) + 1), 'v' || g FROM generate_series(1, 10000) g;
+ANALYZE t_e_subq;
+INSERT INTO t_e_subq SELECT 51, ((g - 1) % 2) + 1, 'v' || g FROM generate_series(1, 1000) g;
+INSERT INTO res SELECT * FROM  check_erows('E-D-16', $$SELECT * FROM (SELECT * FROM t_e_subq) s WHERE ver = 51$$, 1000, 0.20);
+
+-- 【E-D-17】CTE | equal 触发
+-- 预期：CTE 包装后仍触发边界外矫正
+DROP TABLE IF EXISTS t_e_cte;
+CREATE TABLE t_e_cte (ver int, region int, v varchar(32));
+INSERT INTO t_e_cte
+  SELECT ((g - 1) % 10) + 1, ((floor((g - 1)::numeric / 10)::int % 2) + 1), 'v' || g FROM generate_series(1, 10000) g;
+ANALYZE t_e_cte;
+INSERT INTO t_e_cte SELECT 51, ((g - 1) % 2) + 1, 'v' || g FROM generate_series(1, 1000) g;
+INSERT INTO res SELECT * FROM  check_erows('E-D-17', $$WITH q AS (SELECT * FROM t_e_cte) SELECT * FROM q WHERE ver = 51$$, 1000, 0.20);
+
+-- 实际对应规模测算：range D 10 + gt D 11 + equal D 17 = 38，覆盖表类型、统计信息、历史/VACUUM、指定分区、local 索引、子查询/CTE。
 
 -- ---
 
